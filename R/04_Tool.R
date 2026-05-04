@@ -1,0 +1,293 @@
+# %% ToolParameter ----
+#' @title ToolParameter
+#'
+#' @description
+#' Class for a single tool parameter schema
+#'
+#' @field name Character: The name of the parameter.
+#' @field type Character: The type of the parameter.
+#' @field description Character: The description of the parameter.
+#' @field required Logical: Whether the parameter is required.
+#'
+#' @author EDG
+#' @noRd
+ToolParameter <- new_class(
+  "ToolParameter",
+  properties = list(
+    name = character_scalar,
+    type = enum(.SCHEMA_FIELD_TYPES),
+    description = character_scalar,
+    required = logical_scalar
+  )
+)
+
+
+# %% repr.ToolParameter ----
+method(repr, ToolParameter) <- function(x, pad = 0L, output_type = NULL) {
+  output_type <- get_output_type(output_type)
+  repr_ls(
+    S7::props(x),
+    pad = pad,
+    print_class = FALSE,
+    output_type = output_type
+  )
+} # /repr.ToolParameter
+
+
+# %% print.ToolParameter ----
+method(print, ToolParameter) <- function(x, ...) {
+  cat(repr(x, ...), "\n")
+} # /print.ToolParameter
+
+
+# %% tool_param ----
+#' tool_param
+#'
+#' Define a tool parameter schema
+#'
+#' @param name Character: The name of the parameter.
+#' @param type Character: The type of the parameter.
+#' @param description Character: The description of the parameter.
+#' @param required Logical: Whether the parameter is required.
+#'
+#' @return ToolParameter object
+#'
+#' @author EDG
+#' @export
+#'
+#' @examples
+#' tool_param("query", "string", "search query to send", required = TRUE)
+tool_param <- function(
+  name,
+  type,
+  description,
+  required = FALSE
+) {
+  ToolParameter(
+    name = name,
+    type = type,
+    description = description,
+    required = required
+  )
+}
+
+
+# %% Tool ----
+#' @title Tool
+#'
+#' @description
+#' Class for a tool that can be used by an agent
+#'
+#' @field name Character: The name of the tool.
+#' @field function_name Character: The name of the function to call.
+#' @field description Character: The description of the tool.
+#' @field parameters List of ToolParameter: The parameters of the tool.
+#' @field impl Optional function: The user-supplied implementation for custom
+#'   (non-allowlisted) tools. NULL for built-in tools, which are resolved from
+#'   the `rtemis.llm` namespace and hash-verified at dispatch.
+#'
+#' @author EDG
+#' @noRd
+Tool <- new_class(
+  "Tool",
+  properties = list(
+    name = character_scalar,
+    function_name = character_scalar,
+    description = character_scalar,
+    parameters = class_list,
+    impl = optional(class_function)
+  ),
+  validator = function(self) {
+    for (param in self@parameters) {
+      if (!S7_inherits(param, ToolParameter)) {
+        cli::cli_abort(
+          "All elements of 'parameters' must be ToolParameter objects."
+        )
+      }
+    }
+    param_names <- vapply(
+      self@parameters,
+      function(p) p@name,
+      character(1L),
+      USE.NAMES = FALSE
+    )
+    if (anyDuplicated(param_names)) {
+      cli::cli_abort(
+        "Tool parameter names must be unique. Rename duplicate parameters."
+      )
+    }
+    NULL
+  }
+)
+
+
+# %% repr.Tool ----
+method(repr, Tool) <- function(x, pad = 0L, output_type = NULL) {
+  output_type <- get_output_type(output_type)
+  repr_ls(
+    S7::props(x),
+    pad = pad,
+    print_class = FALSE,
+    output_type = output_type
+  )
+}
+
+
+# %% print.Tool ----
+method(print, Tool) <- function(x, ...) {
+  cat(repr(x, ...), "\n")
+} # /print.Tool
+
+
+# %% create_tool ----
+#' create_tool
+#'
+#' Define a tool for an agent
+#'
+#' @param name Character: The name of the tool, e.g. "Wikipedia Search".
+#' @param function_name Character: The name of the function to call, e.g. "query_wikipedia".
+#' @param description Character: The description of the tool.
+#' @param parameters List of `ToolParameter`: The parameters of the tool, each  defined using
+#' [tool_param].
+#'
+#' @return Tool object
+#'
+#' @author EDG
+#' @export
+#'
+#' @examples
+#' tool_addition <- create_tool(
+#'   name = "Addition",
+#'   function_name = "add_numbers",
+#'   description = "Performs arithmetic addition of two numbers.",
+#'   parameters = list(
+#'     tool_param(
+#'       name = "x",
+#'       type = "number",
+#'       description = "The first number to add",
+#'       required = TRUE
+#'     ),
+#'     tool_param(
+#'       name = "y",
+#'       type = "number",
+#'       description = "The second number to add",
+#'       required = TRUE
+#'     )
+#'   )
+#' )
+create_tool <- function(
+  name,
+  function_name,
+  description,
+  parameters = list()
+) {
+  Tool(
+    name = name,
+    function_name = function_name,
+    description = description,
+    parameters = parameters,
+    impl = NULL
+  )
+}
+
+
+# %% create_custom_tool ----
+#' create_custom_tool
+#'
+#' Define a user-supplied tool for an agent. Unlike [create_tool], the caller
+#' provides the R function to invoke (`impl`). Custom tools are outside the
+#' package's allowlist-and-hash enforcement, so the caller vouches for the
+#' code. An agent will refuse to carry a custom tool unless the agent is
+#' created with `allow_custom_tools = TRUE` (see [create_agent]).
+#'
+#' @param name Character: The name of the tool, e.g. "Addition".
+#' @param function_name Character: The name to expose to the model, e.g. "add_numbers".
+#' @param description Character: The description of the tool.
+#' @param parameters List of `ToolParameter`: The parameters of the tool, each defined using
+#'   [tool_param].
+#' @param impl Function: The R function to invoke when the tool is called. Its formal argument
+#'   names must match the `name` fields of `parameters`.
+#'
+#' @return Tool object with `impl` populated.
+#'
+#' @author EDG
+#' @export
+#'
+#' @examples
+#' add_numbers <- function(x, y) x + y
+#' tool_addition <- create_custom_tool(
+#'   name = "Addition",
+#'   function_name = "add_numbers",
+#'   description = "Performs arithmetic addition of two numbers.",
+#'   parameters = list(
+#'     tool_param("x", "number", "The first number to add", required = TRUE),
+#'     tool_param("y", "number", "The second number to add", required = TRUE)
+#'   ),
+#'   impl = add_numbers
+#' )
+create_custom_tool <- function(
+  name,
+  function_name,
+  description,
+  parameters = list(),
+  impl
+) {
+  if (missing(impl) || !is.function(impl)) {
+    cli::cli_abort(
+      "{.arg impl} must be a function. Use {.fn create_tool} for built-in tools."
+    )
+  }
+  Tool(
+    name = name,
+    function_name = function_name,
+    description = description,
+    parameters = parameters,
+    impl = impl
+  )
+}
+
+
+# %% as_list.Tool ----
+#' Convert Tool object to named R list
+#'
+#' Prepare `Tool` definition for use in `httr2` API call
+#'
+#' @param x `Tool` object.
+#'
+#' @return list
+#'
+#' @author EDG
+#' @noRd
+method(as_list, Tool) <- function(x) {
+  required <- sapply(
+    Filter(function(p) p@required, x@parameters),
+    function(p) p@name,
+    USE.NAMES = FALSE
+  )
+  if (length(required) == 0L) {
+    required <- I(character())
+  }
+  list(
+    type = "function",
+    `function` = list(
+      name = x@function_name,
+      description = x@description,
+      parameters = list(
+        type = "object",
+        required = required,
+        properties = structure(
+          lapply(
+            x@parameters,
+            function(p) {
+              list(
+                type = p@type,
+                description = p@description
+              )
+            }
+          ),
+          names = sapply(x@parameters, function(p) p@name)
+        ) # /properties
+      ) # /parameters
+    ) # /function
+  )
+}

@@ -1,0 +1,803 @@
+# Agent.R
+# ::rtemis.llm::
+# 2025- EDG rtemis.org
+
+# --- Internal API ---------------------------------------------------------------------------------
+# %% Agent ----
+#' @title agent
+#'
+#' @description
+#' Class for agents that support reasoning, tool use, structured output, and state management.
+#'
+#' @field llmconfig LLMConfig: The LLMConfig to use.
+#' @field state AgentMemory: The state of the agent contains the message history and metadata.
+#' @field system_prompt Optional character: The system prompt to use.
+#' @field use_memory Logical: Whether to store conversation history in agent state.
+#' @field tools Optional list of Tool objects: The tools available to the agent.
+#' @field max_tool_rounds Integer: Maximum number of tool call rounds per query.
+#' @field output_schema Optional Schema: The output schema to enforce on the agent's response.
+#' @field name Optional character: The name of the agent.
+#' @field allow_custom_tools Logical: If TRUE, the agent may carry tools whose `function_name` is
+#'   not in the package allowlist (`AVAILABLE_TOOLS`). Such tools must supply their own `impl`. The caller
+#'   vouches for the code in any custom tool.
+#' @field logfile Character: Path to the agent's security log. Important! If NULL is passed to
+#'   constructor, the value will be set to
+#'   `getOption("rtemis_security_logfile", tempfile("rtemis_security_log_", fileext = ".jsonl"))` to
+#'   satisfy CRAN policy. It is important to set it to a non-temporary location that will persist
+#'   and you can access. Otherwise, security incidents may be missed. Can be overridden per call
+#'   on [generate].
+#'
+#' @author EDG
+#' @noRd
+Agent <- new_class(
+  "Agent",
+  properties = list(
+    llmconfig = LLMConfig,
+    state = AgentMemory,
+    system_prompt = optional_character_scalar,
+    use_memory = logical_scalar,
+    tools = optional(S7::class_list),
+    max_tool_rounds = pos_integer_scalar,
+    output_schema = optional(Schema),
+    name = optional_character_scalar,
+    allow_custom_tools = logical_scalar,
+    logfile = character_scalar
+  ),
+  constructor = function(
+    llmconfig,
+    state = InProcessAgentMemory(),
+    system_prompt = NULL,
+    use_memory = TRUE,
+    tools = NULL,
+    max_tool_rounds = 3L,
+    output_schema = NULL,
+    name = NULL,
+    allow_custom_tools = FALSE,
+    logfile = NULL,
+    verbosity = 1L
+  ) {
+    # Initialize messages with system prompt within state environment
+    if (!is.null(system_prompt)) {
+      append_message(
+        state,
+        SystemMessage(
+          name = name,
+          content = system_prompt
+        ),
+        verbosity = verbosity - 1L
+      )
+    }
+    if (is.null(logfile)) {
+      logfile <- getOption(
+        "rtemis_security_logfile",
+        tempfile("rtemis_security_log_", fileext = ".jsonl")
+      )
+    }
+    check_scalar_character(logfile, "logfile")
+    new_object(
+      S7_object(),
+      llmconfig = llmconfig,
+      state = state,
+      system_prompt = system_prompt,
+      use_memory = use_memory,
+      tools = tools,
+      max_tool_rounds = max_tool_rounds,
+      output_schema = output_schema,
+      name = name,
+      allow_custom_tools = allow_custom_tools,
+      logfile = logfile
+    )
+  },
+  validator = function(self) {
+    if (!is.null(self@tools)) {
+      fn_names <- vapply(
+        self@tools,
+        function(t) {
+          if (!S7_inherits(t, Tool)) NA_character_ else t@function_name
+        },
+        character(1)
+      )
+      dups <- unique(fn_names[duplicated(fn_names) & !is.na(fn_names)])
+      if (length(dups) > 0L) {
+        cli::cli_abort(c(
+          "Duplicate tool {.field function_name}: {.val {dups}}.",
+          i = "Each tool on an agent must have a unique {.field function_name}."
+        ))
+      }
+      for (tool in self@tools) {
+        # Check that each tool is a Tool object
+        if (!S7_inherits(tool, Tool)) {
+          cli::cli_abort("All elements of 'tools' must be Tool objects.")
+        }
+        is_builtin <- tool@function_name %in% AVAILABLE_TOOLS
+        if (is_builtin) {
+          if (!is.null(tool@impl)) {
+            cli::cli_abort(c(
+              "Built-in tool {.val {tool@function_name}} must not supply {.arg impl}.",
+              i = "Built-in tools are resolved from the package namespace and hash-verified."
+            ))
+          }
+        } else {
+          if (!self@allow_custom_tools) {
+            cli::cli_abort(c(
+              "Tool {.val {tool@function_name}} is not part of the allowed tool set.",
+              i = "To use custom tools, pass {.code allow_custom_tools = TRUE} to {.fn create_agent}."
+            ))
+          }
+          if (is.null(tool@impl)) {
+            cli::cli_abort(c(
+              "Custom tool {.val {tool@function_name}} must supply {.arg impl}.",
+              i = "Use {.fn create_custom_tool} to construct it."
+            ))
+          }
+        }
+      }
+    }
+  }
+)
+
+
+# %% repr.Agent ----
+method(repr, Agent) <- function(x, pad = 0L, output_type = NULL) {
+  output_type <- get_output_type(output_type)
+  paste0(
+    repr_S7name("Agent", output_type = output_type),
+    fmt("         Name: ", bold = TRUE, pad = pad, output_type = output_type),
+    if (is.null(x@name)) {
+      "(Undefined)"
+    } else {
+      x@name
+    },
+    "\n",
+    fmt("System Prompt: ", bold = TRUE, pad = pad, output_type = output_type),
+    if (is.null(x@system_prompt)) {
+      "(Undefined)"
+    } else {
+      fmt(
+        paste0(
+          substr(x@system_prompt, 1, 60),
+          if (nchar(x@system_prompt) > 60) {
+            "..."
+          } else {
+            ""
+          }
+        ),
+        output_type = output_type
+      )
+    },
+    "\n",
+    fmt("       Memory: ", bold = TRUE, pad = pad, output_type = output_type),
+    fmt(
+      if (x@use_memory) "Enabled" else "Disabled",
+      output_type = output_type
+    ),
+    "\n",
+    fmt("        Tools: ", bold = TRUE, pad = pad, output_type = output_type),
+    if (is.null(x@tools)) {
+      "(None)\n"
+    } else {
+      paste0(
+        paste0(
+          "\n",
+          sapply(
+            x@tools,
+            function(tool) {
+              is_custom <- !is.null(tool@impl)
+              paste0(
+                "               - ",
+                fmt(tool@function_name, bold = TRUE, output_type = output_type),
+                if (is_custom) " (custom)" else "",
+                ": ",
+                tool@description
+              )
+            }
+          ),
+          collapse = ""
+        ),
+        "\n"
+      )
+    }, # / if tools
+    if (!is.null(x@output_schema)) {
+      paste0(
+        fmt("Output Schema: \n", bold = TRUE, output_type = output_type),
+        repr_ls(
+          as_list(x@output_schema),
+          pad = pad + 15L,
+          output_type = output_type,
+          limit = 20L
+        )
+      )
+    },
+    # llmconfig
+    fmt("   LLM Config:\n", bold = TRUE, pad = pad, output_type = output_type),
+    repr(x@llmconfig, pad = pad + 15L, output_type = output_type)
+  ) # / paste0
+}
+
+
+# %% print.Agent ----
+method(print, Agent) <- function(x, output_type = NULL, ...) {
+  cat(repr(x, output_type = output_type), "\n")
+}
+
+
+# %% get_model_name.Agent ----
+method(get_model_name, Agent) <- function(x) {
+  x@llmconfig@model_name
+}
+
+
+# %% create_llm_message.Agent ----
+#' create_llm_message method for `Agent`
+#'
+#' @param x `Agent` object
+#' @param content Character: The content of the message.
+#' @param reasoning Optional character: The reasoning trace.
+#' @param tool_calls Optional list: Tool call information.
+#'
+#' @return An `LLMMessage` object.
+#'
+#' @author EDG
+#' @noRd
+method(create_llm_message, Agent) <- function(
+  x,
+  content,
+  reasoning = NULL,
+  tool_calls = NULL,
+  metadata = list()
+) {
+  create_llm_message(
+    x@llmconfig,
+    content = content,
+    reasoning = reasoning,
+    tool_calls = tool_calls,
+    metadata = metadata,
+    name = x@name
+  )
+}
+
+
+# %% create_llm_message.OllamaConfig ----
+# Needs to follow Agent definition
+#' create_llm_message method for Agent with Ollama backend
+#'
+#' @param x OllamaConfig object
+#' @param content Character: The content of the message.
+#' @param reasoning Optional character: The reasoning trace.
+#' @param tool_calls Optional list: Tool call information.
+#'
+#' @return An OllamaMessage object.
+#'
+#' @author EDG
+#' @noRd
+method(create_llm_message, OllamaConfig) <- function(
+  x,
+  content,
+  reasoning = NULL,
+  tool_calls = NULL,
+  name = NULL,
+  metadata = list()
+) {
+  OllamaMessage(
+    content = content,
+    name = name,
+    metadata = metadata,
+    model_name = x@model_name,
+    reasoning = reasoning,
+    tool_calls = tool_calls
+  )
+}
+
+
+# %% create_llm_message.OpenAIConfig ----
+#' create_llm_message method for Agent with OpenAI-compatible backend
+#'
+#' @param x OpenAIConfig object.
+#' @param content Character: The content of the message.
+#' @param reasoning Optional character: The reasoning trace.
+#' @param tool_calls Optional list: Tool call information.
+#' @param name Optional character: The agent name.
+#' @param metadata List: Message metadata.
+#'
+#' @return An OpenAIMessage object.
+#'
+#' @author EDG
+#' @noRd
+method(create_llm_message, OpenAIConfig) <- function(
+  x,
+  content,
+  reasoning = NULL,
+  tool_calls = NULL,
+  name = NULL,
+  metadata = list()
+) {
+  OpenAIMessage(
+    content = content,
+    name = name,
+    metadata = metadata,
+    model_name = x@model_name,
+    reasoning = reasoning,
+    tool_calls = tool_calls,
+    provider = .openai_provider_name(x)
+  )
+}
+
+
+# %% create_llm_message.AnthropicConfig ----
+#' create_llm_message method for Agent with Anthropic backend
+#'
+#' @param x AnthropicConfig object.
+#' @param content Character: The content of the message.
+#' @param reasoning Optional character: The reasoning trace.
+#' @param tool_calls Optional list: Tool call information.
+#' @param name Optional character: The agent name.
+#' @param metadata List: Message metadata.
+#'
+#' @return A AnthropicMessage object.
+#'
+#' @author EDG
+#' @noRd
+method(create_llm_message, AnthropicConfig) <- function(
+  x,
+  content,
+  reasoning = NULL,
+  tool_calls = NULL,
+  name = NULL,
+  metadata = list()
+) {
+  AnthropicMessage(
+    content = content,
+    name = name,
+    metadata = metadata,
+    model_name = x@model_name,
+    reasoning = reasoning,
+    tool_calls = tool_calls
+  )
+}
+
+
+# %% get_messages.Agent ----
+#' Get messages from Agent
+#'
+#' Get list of Message objects from the Agent's state
+#'
+#' @param x Agent object
+#'
+#' @return List of Message objects
+#'
+#' @author EDG
+#' @noRd
+method(get_messages, Agent) <- function(x, last = FALSE) {
+  get_messages(x@state, last = last)
+}
+
+
+# --- Public API -----------------------------------------------------------------------------------
+# %% create_agent ----
+#' Create a rtemis.llm Agent
+#'
+#' @param llmconfig `LLMConfig`: The LLM configuration to use. Create using one of [config_Ollama],
+#'   [config_OpenAI], or [config_Anthropic].
+#' @param system_prompt Optional character: The system prompt to use.
+#' @param use_memory Logical: Whether to use conversation memory.
+#' @param tools Optional list of Tool objects: The tools available to the agent.
+#' @param max_tool_rounds Integer: Maximum number of tool call rounds per query.
+#' @param output_schema Optional Schema: The output schema to enforce on the agent's response
+#'   created using [schema] and [field].
+#' @param name Optional character: The name of the agent.
+#' @param allow_custom_tools Logical: If TRUE, allow the agent to carry tools whose
+#'   `function_name` is not in the package allowlist. Such tools must be built via
+#'   [create_custom_tool] and supply their own function body. The caller vouches for that
+#'   code: built-in package guarantees (allowlist + hash verification) do not apply to it.
+#'   Defaults to FALSE.
+#' @param logfile Optional character: Path to the agent's security log. Important! If NULL, the
+#'   value will be set to
+#'   `getOption("rtemis_security_logfile", tempfile("rtemis_security_log_", fileext = ".jsonl"))` to
+#'   satisfy CRAN policy. It is important to set it to a non-temporary location that will persist
+#'   and you can access. Otherwise, security incidents may be missed. Can be overridden per call
+#'   on [generate].
+#' @param verbosity Integer: Verbosity level.
+#'
+#' @return `Agent` object
+#'
+#' @author EDG
+#' @export
+#'
+#' @examples
+#' # Requires Ollama server running and gemma4:e4b model available
+#' \dontrun{
+#'   agent <- create_agent(
+#'     config_Ollama(
+#'       model_name = "gemma4:e4b",
+#'       temperature = 0.2
+#'     ),
+#'     system_prompt = "You are professor of Trance at the Institute of Advanced Beat Studies.",
+#'     use_memory = TRUE
+#'   )
+#' }
+create_agent <- function(
+  llmconfig,
+  system_prompt = SYSTEM_PROMPT_DEFAULT,
+  use_memory = TRUE,
+  tools = NULL,
+  max_tool_rounds = 3L,
+  output_schema = NULL,
+  name = NULL,
+  allow_custom_tools = FALSE,
+  logfile = NULL,
+  verbosity = 1L
+) {
+  check_optional_scalar_character(system_prompt, "system_prompt")
+  check_logical_scalar(use_memory, "use_memory")
+  max_tool_rounds <- clean_int(max_tool_rounds)
+  check_pos_integer_scalar(max_tool_rounds, "max_tool_rounds")
+  check_optional_scalar_character(name, "name")
+  check_logical_scalar(allow_custom_tools, "allow_custom_tools")
+  check_optional_scalar_character(logfile, "logfile")
+  agent <- Agent(
+    llmconfig = llmconfig,
+    system_prompt = system_prompt,
+    use_memory = use_memory,
+    tools = tools,
+    max_tool_rounds = max_tool_rounds,
+    output_schema = output_schema,
+    name = name,
+    allow_custom_tools = allow_custom_tools,
+    logfile = logfile
+  )
+  if (allow_custom_tools && verbosity > 0L) {
+    cli::cli_inform(c(
+      "!" = "Agent created with {.code allow_custom_tools = TRUE}.",
+      i = "Custom tools bypass the package's allowlist and hash verification."
+    ))
+  }
+  agent
+}
+
+
+# %% generate.Agent ----
+# Reference: https://docs.ollama.com/api/chat
+#' Generate method for rtemis.llm Agent
+#'
+#' @param x `Agent` object
+#' @param prompt Character: The prompt to send to the agent.
+#' @param temperature Optional numeric \[0, 2\]: Per-call temperature override.
+#' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
+#' @param max_tokens Optional integer \[1, Inf): Per-call maximum tokens to generate.
+#' @param stop Optional character: Stop sequence(s).
+#' @param image_path Optional character: Path to an image to include in the prompt.
+#' @param think Optional logical: Whether to enable thinking (reasoning trace) for this call. Only
+#' supported by certain models.
+#' @param output_schema Optional Schema: The output schema to enforce on the agent's response.
+#' Important: if NULL, the agent's default output_schema, if defined, will be used. This means that
+#' the generate call's schema takes precedence over the agent's schema.
+#' @param commit_to_memory Logical: Whether to commit this interaction to the agent's memory.
+#' @param use_tools Logical: Whether to allow the agent to use tools.
+#' @param echo Logical: Whether to echo the prompt and response.
+#' @param logfile Optional character: Per-call override for the audit/security log path. If NULL,
+#'   defaults to the agent's `logfile` field (set this using [create_agent]).
+#' @param verbosity Integer: Verbosity level.
+#' @param ... Backend-specific per-call options forwarded to the request builder
+#' (e.g. `top_k`, `seed`). See [generate].
+#'
+#' @return List of `Message` objects representing the conversation history.
+#'
+#' @details
+#' Memory: if agent was initialized with use_memory = TRUE, the conversation history will be
+#' maintained. If any call to generate() specifies `commit_to_memory = FALSE`, the message and its
+#' response will not be added to the conversation history. If the agent was initialized with
+#' use_memory = FALSE, the conversation history will not be maintained.
+#'
+#' @author EDG
+#' @noRd
+method(generate, Agent) <- function(
+  x,
+  prompt,
+  temperature = NULL,
+  top_p = NULL,
+  max_tokens = NULL,
+  stop = NULL,
+  image_path = NULL,
+  think = NULL,
+  output_schema = NULL,
+  commit_to_memory = TRUE,
+  use_tools = TRUE,
+  echo = FALSE,
+  logfile = NULL,
+  verbosity = 1L,
+  ...
+) {
+  # Get output schema: First check function argument, then agent's default
+  if (is.null(output_schema)) {
+    output_schema <- x@output_schema
+  }
+  # Resolve logfile: per-call arg > agent field
+  logfile <- logfile %||% x@logfile
+  check_scalar_character(logfile, "logfile")
+  # Check input
+  check_inherits(prompt, "character")
+  update_state <- x@use_memory && commit_to_memory
+  # If not updating state, create a temporary InProcessAgentMemory for this interaction only
+  if (!update_state) {
+    .tempState <- InProcessAgentMemory()
+    # Append system prompt
+    append_message(
+      .tempState,
+      SystemMessage(
+        name = x@name,
+        content = x@system_prompt
+      ),
+      echo = echo,
+      verbosity = verbosity - 1L
+    )
+  }
+  running_state <- if (update_state) x@state else .tempState
+  # {++} State: Append initial InputMessage
+  append_message(
+    running_state,
+    InputMessage(
+      content = prompt,
+      image_path = image_path
+    ),
+    echo = echo,
+    verbosity = verbosity - 1L
+  )
+
+  # Per-call overrides forwarded to every build_chat_request_body call
+  overrides <- list(
+    temperature = temperature,
+    top_p = top_p,
+    max_tokens = max_tokens,
+    stop = stop
+  )
+  extra <- list(...)
+  overrides <- c(overrides, extra)
+
+  # {Initial Request Body}
+  request_body <- do.call(
+    build_chat_request_body,
+    c(
+      list(
+        x@llmconfig,
+        state = running_state,
+        tools = x@tools,
+        output_schema = output_schema,
+        think = think,
+        use_tools = use_tools
+      ),
+      overrides
+    )
+  )
+
+  msg(repr_bracket(x@llmconfig@model_name), "working...", verbosity = verbosity)
+
+  # {>>} Perform initial request
+  resp <- perform_chat_request(
+    x@llmconfig,
+    request_body = request_body,
+    verbosity = verbosity
+  )
+  # Replace working message with done
+  msg(repr_bracket(x@llmconfig@model_name), "done.", verbosity = verbosity)
+
+  # {<<} Initial response
+  res <- parse_chat_response(x@llmconfig, resp)
+
+  # {++} Append initial response
+  append_message(
+    running_state,
+    create_llm_message(
+      x,
+      content = res[["content"]],
+      reasoning = res[["reasoning"]],
+      tool_calls = res[["tool_calls"]],
+      metadata = res[["metadata"]]
+    ),
+    echo = echo,
+    verbosity = verbosity - 1L
+  )
+
+  n_completed_tool_rounds <- 0L
+  while (n_completed_tool_rounds < x@max_tool_rounds) {
+    # {?>_} Check for tool calls
+    if (!is.null(res[["tool_calls"]]) && length(res[["tool_calls"]]) > 0L) {
+      n_completed_tool_rounds <- n_completed_tool_rounds + 1L
+      tool_names <- sapply(
+        res[["tool_calls"]],
+        function(tc) tc[["function"]][["name"]]
+      )
+      n_tool_calls <- length(tool_names)
+      msg(
+        "Agent wants to perform",
+        n_tool_calls,
+        ngettext(n_tool_calls, "tool call.", " tool calls."),
+        verbosity = verbosity
+      )
+
+      # Initialize tool responses
+      tool_responses <- structure(
+        vector("list", n_tool_calls),
+        names = tool_names
+      )
+
+      # Call each tool
+      # (how likely is it that an agent will call multiple tools at once rather than one at a time?)
+      for (i in seq_along(tool_responses)) {
+        # {/\} Check that tool requested by LLM exists in agent's tool list
+        # Note that Agent validator already checks that all tools in agent's tool list are allowed.
+        if (
+          !use_tools ||
+            is.null(x@tools) ||
+            !(tool_names[i] %in% sapply(x@tools, function(t) t@function_name))
+        ) {
+          # {!!} Report security incident
+          report_agent_unauthorized_tool(
+            agent = x,
+            issue = "Unauthorized tool request",
+            tool_requested = tool_names[i],
+            logfile = logfile
+          )
+          cli::cli_abort(c(
+            "Agent requested tool '{.val {tool_names[i]}}' which is not in the agent's tool list.",
+            i = "This incident has been reported."
+          ))
+        }
+        # {/\!} Resolve tool function:
+        #   - Built-in: hash-verify via validate_function(), resolve from package namespace.
+        #   - Custom  : use caller-supplied impl.
+        tool_obj <- x@tools[[
+          which(sapply(x@tools, function(t) t@function_name) == tool_names[i])[
+            1L
+          ]
+        ]]
+        is_builtin <- tool_obj@function_name %in% AVAILABLE_TOOLS
+        if (is_builtin) {
+          validate_function(tool_names[i])
+          fn <- get(
+            tool_names[i],
+            envir = asNamespace("rtemis.llm"),
+            inherits = FALSE
+          )
+        } else {
+          fn <- tool_obj@impl
+        }
+
+        # {>_} Call tool
+        msg("Invoking tool:", highlight(tool_names[i]), verbosity = verbosity)
+        tool_call <- res[["tool_calls"]][[i]]
+        args <- decode_tool_arguments(x@llmconfig, tool_call)
+        if (!.is_named_list(args)) {
+          cli::cli_abort(c(
+            "Tool arguments for {.val {tool_names[i]}} must be a named list.",
+            i = "Check the tool schema and model tool-call response."
+          ))
+        }
+        # Force output_type = "json" where supported
+        if ("output_type" %in% names(formals(fn))) {
+          args[["output_type"]] <- "json"
+        }
+        tool_responses[[i]] <- do.call(fn, args)
+        if (verbosity > 0L) {
+          msg("Tool", highlight(tool_names[i]), "returned response.")
+        }
+      } # /for each tool
+      #
+
+      # {++} Append ToolMessages to state
+      for (i in seq_along(tool_responses)) {
+        append_message(
+          running_state,
+          build_tool_message(
+            x@llmconfig,
+            tool_call = res[["tool_calls"]][[i]],
+            tool_name = tool_names[i],
+            tool_response = tool_responses[[i]]
+          ),
+          echo = echo,
+          verbosity = verbosity - 1L
+        )
+      }
+
+      # Ollama does not consume native role = "tool" messages in this package's current flow.
+      # Preserve its existing behavior by summarizing tool results as a user-role AgentMessage.
+      if (S7_inherits(x@llmconfig, OllamaConfig)) {
+        tool_response_prompt <- paste0(
+          sapply(
+            names(tool_responses),
+            function(tn) {
+              paste0(
+                "Tool '",
+                tn,
+                "' response:\n\n",
+                .tool_response_to_character(tool_responses[[tn]]),
+                "\n"
+              )
+            }
+          ),
+          collapse = "\n"
+        )
+        tool_response_prompt <- paste0(
+          tool_response_prompt,
+          "\n",
+          "Acknowledge the tools used and include citations where applicable.",
+          if (x@max_tool_rounds - n_completed_tool_rounds > 0L) {
+            paste0(
+              " If you do not have sufficient information, you may use up to ",
+              x@max_tool_rounds - n_completed_tool_rounds,
+              " more tool call",
+              ngettext(
+                x@max_tool_rounds - n_completed_tool_rounds,
+                " round",
+                " rounds"
+              ),
+              ", if necessary."
+            )
+          } else {
+            paste(
+              "If you do not have sufficient information to answer the original query, say so",
+              "clearly and suggest alternative ways to obtain the information."
+            )
+          },
+          " Remember the original query you are answering:\n\n",
+          '"',
+          prompt,
+          '"\n'
+        )
+        append_message(
+          running_state,
+          AgentMessage(
+            content = tool_response_prompt
+          ),
+          echo = echo,
+          verbosity = verbosity - 1L
+        )
+      }
+
+      # Now, send another prompt to the agent with the tool responses
+      if (verbosity > 0L) {
+        msg("Sending tool responses back to agent...")
+      }
+      followup_request_body <- do.call(
+        build_chat_request_body,
+        c(
+          list(
+            x@llmconfig,
+            state = running_state,
+            tools = x@tools,
+            output_schema = output_schema,
+            use_tools = use_tools
+          ),
+          overrides
+        )
+      )
+      # {>>} Perform follow-up request
+      followup_resp <- perform_chat_request(
+        x@llmconfig,
+        request_body = followup_request_body,
+        verbosity = verbosity
+      )
+      # Replace working message with done
+      msg(repr_bracket(x@llmconfig@model_name), "done.", verbosity = verbosity)
+      # {<<} Follow-up response
+      res <- parse_chat_response(x@llmconfig, followup_resp)
+
+      # {++} Append response to messages as LLMMessage
+      append_message(
+        running_state,
+        create_llm_message(
+          x,
+          content = res[["content"]],
+          reasoning = res[["reasoning"]],
+          tool_calls = res[["tool_calls"]],
+          metadata = res[["metadata"]]
+        ),
+        echo = echo,
+        verbosity = verbosity - 1L
+      )
+    } else {
+      # No tool calls, break
+      break
+    }
+  } # /while max_tool_rounds < max_tool_rounds
+  get_messages(running_state)
+}
