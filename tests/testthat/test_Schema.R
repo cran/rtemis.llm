@@ -194,3 +194,235 @@ test_that("Agent with output_schema works", {
   testthat::expect_true(S7_inherits(agent@output_schema, Schema))
   testthat::expect_equal(agent@output_schema, output_schema)
 }) # /Agent with output_schema
+
+
+# %% Field enum ----
+test_that("field() round-trips an enum through as_list() and to_json()", {
+  f <- field(
+    "support",
+    "Support level",
+    type = "string",
+    enum = c("none", "partial", "complete")
+  )
+  f_list <- as_list(f)
+  testthat::expect_equal(
+    as.character(f_list[["enum"]]),
+    c("none", "partial", "complete")
+  )
+  f_json <- jsonlite::fromJSON(to_json(f), simplifyVector = FALSE)
+  testthat::expect_equal(
+    unlist(f_json[["enum"]]),
+    c("none", "partial", "complete")
+  )
+})
+
+test_that("a single permitted value stays a JSON array", {
+  f_json <- to_json(field("support", "Support level", enum = "none"))
+  testthat::expect_match(f_json, '"enum":["none"]', fixed = TRUE)
+})
+
+test_that("an integer field's enum is emitted as JSON numbers", {
+  f <- field("grade", "Grade", type = "integer", enum = c("1", "2", "3"))
+  testthat::expect_identical(as.integer(as_list(f)[["enum"]]), 1:3)
+  testthat::expect_match(to_json(f), '"enum":[1,2,3]', fixed = TRUE)
+})
+
+test_that("as_list.Schema() nests enum inside the property, not the schema", {
+  sch <- schema(
+    "SupportSchema",
+    field("support", "Support level", enum = c("none", "complete"))
+  )
+  sch_list <- as_list(sch)
+  testthat::expect_null(sch_list[["enum"]])
+  testthat::expect_equal(
+    as.character(sch_list[["properties"]][["support"]][["enum"]]),
+    c("none", "complete")
+  )
+})
+
+test_that("Field rejects enum on a type that cannot carry one", {
+  testthat::expect_error(
+    field("flag", "Flag", type = "boolean", enum = c("yes", "no")),
+    "boolean"
+  )
+  testthat::expect_error(
+    field("tags", "Tags", type = "array", items = "string", enum = c("a", "b")),
+    "array"
+  )
+})
+
+test_that("Field rejects an empty, missing, or duplicated enum", {
+  testthat::expect_error(field("support", "Support", enum = character(0)))
+  testthat::expect_error(
+    field("support", "Support", enum = c("none", NA_character_))
+  )
+  testthat::expect_error(field("support", "Support", enum = c("a", "a")))
+})
+
+test_that("Field rejects enum values that do not fit the declared type", {
+  testthat::expect_error(
+    field("grade", "Grade", type = "integer", enum = c("a", "b")),
+    "integer"
+  )
+  # as.integer() would silently truncate this one.
+  testthat::expect_error(
+    field("grade", "Grade", type = "integer", enum = c("1.5", "2")),
+    "integer"
+  )
+})
+
+
+# %% enum backend pass-through ----
+test_that("enum reaches the Ollama request body's `format` field", {
+  testthat::local_mocked_bindings(
+    ollama_check_model = function(x) invisible(NULL),
+    .package = "rtemis.llm"
+  )
+  sch <- schema(
+    "SupportSchema",
+    field("support", "Support level", enum = c("none", "partial", "complete"))
+  )
+  state <- InProcessAgentMemory()
+  append_message(
+    state,
+    InputMessage(content = "hi"),
+    echo = FALSE,
+    verbosity = 0L
+  )
+  request_body <- build_chat_request_body(
+    config_Ollama(model_name = "gemma4:e4b"),
+    state = state,
+    output_schema = sch
+  )
+  testthat::expect_equal(
+    as.character(
+      request_body[["format"]][["properties"]][["support"]][["enum"]]
+    ),
+    c("none", "partial", "complete")
+  )
+})
+
+test_that("clean_openai_schema() leaves enum untouched", {
+  sch_list <- as_list(schema(
+    "SupportSchema",
+    field("support", "Support level", enum = c("none", "partial", "complete"))
+  ))
+  cleaned <- clean_openai_schema(sch_list)
+  testthat::expect_equal(
+    as.character(cleaned[["properties"]][["support"]][["enum"]]),
+    c("none", "partial", "complete")
+  )
+})
+
+test_that("the Anthropic structured-output tool keeps enum", {
+  sch_list <- as_list(schema(
+    "SupportSchema",
+    field("support", "Support level", enum = c("none", "partial", "complete"))
+  ))
+  tool_spec <- .anthropic_structured_output_tool(sch_list)
+  testthat::expect_equal(
+    as.character(
+      tool_spec[["input_schema"]][["properties"]][["support"]][["enum"]]
+    ),
+    c("none", "partial", "complete")
+  )
+})
+
+
+test_that("an array field says what it holds", {
+  # A type name, the common case.
+  f <- field("questions", "Each question", type = "array", items = "string")
+  testthat::expect_identical(as_list(f)[["items"]], list(type = "string"))
+
+  # A Field, where the elements need a description or an enum of their own.
+  f <- field(
+    "flags",
+    "Flags",
+    type = "array",
+    items = field("flag", "One flag", enum = c("low", "high"))
+  )
+  item <- as_list(f)[["items"]]
+  testthat::expect_identical(item[["type"]], "string")
+  testthat::expect_identical(as.character(item[["enum"]]), c("low", "high"))
+  # An item schema is positional, so the Field's name has nowhere to go.
+  testthat::expect_null(item[["name"]])
+
+  # A Schema, for an array of objects.
+  f <- field(
+    "results",
+    "Rows",
+    type = "array",
+    items = schema(
+      "Row",
+      field("name", "n"),
+      field("value", "v", type = "number")
+    )
+  )
+  item <- as_list(f)[["items"]]
+  testthat::expect_identical(item[["type"]], "object")
+  testthat::expect_named(item[["properties"]], c("name", "value"))
+})
+
+test_that("an array with no items is refused, and items is refused elsewhere", {
+  # Valid JSON Schema, useless in practice: OpenAI's strict mode rejects it and
+  # a constrained-decoding backend has nothing to constrain.
+  testthat::expect_error(
+    field("a", "A", type = "array"),
+    "must declare what it contains"
+  )
+  testthat::expect_error(
+    field("a", "A", type = "array", items = "widget"),
+    "must be one of"
+  )
+  testthat::expect_error(
+    field("a", "A", type = "array", items = list(type = "string")),
+    "must be one of"
+  )
+  testthat::expect_error(
+    field("s", "S", type = "string", items = "string"),
+    "cannot be set on a \"string\" field"
+  )
+})
+
+test_that("a field cannot be an object, at the top level or as items", {
+  # A Field carries no properties, so an "object" Field is a schema OpenAI and
+  # Anthropic reject; it fails here instead of at request time.
+  testthat::expect_error(
+    field("meta", "Arbitrary metadata", type = "object"),
+    "items = schema"
+  )
+  testthat::expect_error(
+    field(
+      "rows",
+      "Rows",
+      type = "array",
+      items = field("row", "A row", type = "object")
+    ),
+    "items = schema"
+  )
+  # A tool parameter is not a Field and keeps "object".
+  testthat::expect_identical(
+    tool_param("payload", "object", "Arbitrary payload")@type,
+    "object"
+  )
+})
+
+test_that("every backend passes an array schema through intact", {
+  sch <- schema(
+    "Extraction",
+    field("items", "Each item", type = "array", items = "string")
+  )
+  for (clean in list(clean_openai_schema, clean_anthropic_schema)) {
+    got <- clean(as_list(sch))
+    testthat::expect_identical(
+      got[["properties"]][["items"]][["items"]],
+      list(type = "string")
+    )
+  }
+  # Ollama takes the schema as-is.
+  testthat::expect_match(
+    to_json(sch),
+    '"items":\\{"type":"string"\\}',
+    fixed = FALSE
+  )
+})

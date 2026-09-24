@@ -17,8 +17,8 @@
 LLM <- new_class(
   "LLM",
   properties = list(
-    name = optional_character_scalar,
-    system_prompt = character_scalar
+    name = prop_string(nullable = TRUE, description = "LLM name"),
+    system_prompt = prop_string(description = "System prompt")
   ),
   constructor = function(name = NULL, system_prompt) {
     new_object(S7_object(), name = name, system_prompt = system_prompt)
@@ -174,7 +174,8 @@ OpenAI <- new_class(
 method(repr, OpenAI) <- function(x, output_type = NULL) {
   output_type <- get_output_type(output_type)
   paste0(
-    repr_S7name("OpenAI", output_type = output_type),
+    # The class name rather than a literal, so an `Apple` prints as `Apple`.
+    repr_S7name(sub(".*::", "", class(x)[1]), output_type = output_type),
     if (!is.null(x@name)) {
       paste0(
         fmt("         Name: ", bold = TRUE, output_type = output_type),
@@ -208,6 +209,39 @@ method(repr, OpenAI) <- function(x, output_type = NULL) {
 method(print, OpenAI) <- function(x, output_type = NULL, ...) {
   cat(repr(x, output_type = output_type), "\n")
 } # /print.OpenAI
+
+
+# %% Apple ----
+#' @title Apple Class
+#'
+#' @description
+#' Apple Foundation Models LLM class: an `OpenAI` whose configuration is an
+#' `AppleConfig`. It adds no behavior of its own; `generate.OpenAI` serves it.
+#'
+#' @author EDG
+#' @noRd
+Apple <- new_class(
+  "Apple",
+  parent = OpenAI,
+  properties = list(
+    config = AppleConfig
+  ),
+  constructor = function(
+    name = NULL,
+    config,
+    system_prompt,
+    output_schema = NULL
+  ) {
+    new_object(
+      OpenAI(
+        name = name,
+        config = config,
+        system_prompt = system_prompt,
+        output_schema = output_schema
+      )
+    )
+  }
+)
 
 
 # %% Anthropic ----
@@ -295,8 +329,11 @@ method(print, Anthropic) <- function(x, output_type = NULL, ...) {
 #' @param stop Optional character: Stop sequence(s).
 #' @param think Optional logical or character: Whether to enable thinking.
 #' @param output_schema Optional Schema: Per-call output schema override.
+#' @inheritParams generate
 #' @param verbosity Integer: Verbosity level.
-#' @param ... Additional per-call options: `top_k` (integer), `seed` (integer).
+#' @param ... Additional per-call options: `top_k` (integer), `seed` (integer),
+#' `num_ctx` (integer), `keep_alive` (character or numeric), `logprobs` (logical),
+#' `top_logprobs` (integer).
 #'
 #' @return OllamaMessage object
 #' @author EDG
@@ -312,97 +349,29 @@ method(generate, Ollama) <- function(
   think = NULL,
   output_schema = NULL,
   verbosity = 1L,
+  validate_output = TRUE,
+  on_validation_failure = c("warn", "collect", "abort"),
   ...
 ) {
   # Check input
+  on_validation_failure <- match.arg(on_validation_failure)
+  output_schema <- output_schema %||% x@output_schema
+  validator <- .prepare_output_validation(
+    output_schema,
+    validate_output,
+    on_validation_failure
+  )
   check_inherits(prompt, "character")
-  effective_think <- think %||% x@config@think
-  .check_ollama_think(effective_think, "think")
   extra <- list(...)
   top_k <- extra[["top_k"]]
   seed <- extra[["seed"]]
-  options <- list(
-    temperature = temperature %||% x@config@temperature
-  )
-  if (!is.null(top_p)) {
-    options[["top_p"]] <- top_p
-  }
-  if (!is.null(top_k)) {
-    options[["top_k"]] <- as.integer(top_k)
-  }
-  if (!is.null(seed)) {
-    options[["seed"]] <- as.integer(seed)
-  }
-  if (!is.null(max_tokens)) {
-    options[["num_predict"]] <- as.integer(max_tokens)
-  }
-  if (!is.null(stop)) {
-    options[["stop"]] <- as.character(stop)
-  }
-  # Request
-  request_body <- list(
-    model = x@config@model_name,
-    system = x@system_prompt,
-    prompt = prompt,
-    stream = FALSE,
-    options = options
-  )
-  if (!is.null(effective_think)) {
-    request_body[["think"]] <- effective_think
-  }
-  effective_schema <- output_schema %||% x@output_schema
-  if (!is.null(effective_schema)) {
-    request_body[["format"]] <- as_list(effective_schema)
-  }
-  msg(repr_bracket(x@config@model_name), "working...", verbosity = verbosity)
-  # Perform request
-  resp <- httr2::request(paste0(x@config@base_url, "/api/generate")) |>
-    httr2::req_body_json(request_body) |>
-    httr2::req_user_agent("rtemis.llm-r LLM (www.rtemis.org)") |>
-    httr2::req_error(is_error = function(resp) FALSE) |>
-    httr2::req_perform(verbosity = max(verbosity - 1L, 0L))
-  # Check for errors
-  .check_http_response(resp, "Ollama")
-
-  # Replace working message with done
-  msg(repr_bracket(x@config@model_name), "done.", verbosity = verbosity)
-  as_OllamaMessage(httr2::resp_body_json(resp))
-}
-
-
-# %% generate.OpenAI ----
-#' Generate method for OpenAI-compatible LLMs
-#'
-#' @param x OpenAI object.
-#' @param prompt Character: The prompt to send to the model.
-#' @param temperature Optional numeric \[0, 2\]: Per-call temperature override.
-#' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
-#' @param max_tokens Optional integer \[1, Inf): Maximum tokens to generate.
-#' @param stop Optional character: Stop sequence(s).
-#' @param think Optional logical: Whether to enable thinking options.
-#' @param output_schema Optional Schema: Per-call output schema override.
-#' @param verbosity Integer: Verbosity level.
-#' @param ... Additional per-call options: `seed` (integer).
-#'
-#' @return OpenAIMessage object
-#' @author EDG
-#'
-#' @noRd
-method(generate, OpenAI) <- function(
-  x,
-  prompt,
-  temperature = NULL,
-  top_p = NULL,
-  max_tokens = NULL,
-  stop = NULL,
-  think = NULL,
-  output_schema = NULL,
-  verbosity = 1L,
-  ...
-) {
-  check_inherits(prompt, "character")
-  extra <- list(...)
-  seed <- extra[["seed"]]
+  num_ctx <- extra[["num_ctx"]]
+  keep_alive <- extra[["keep_alive"]]
+  logprobs <- extra[["logprobs"]]
+  top_logprobs <- extra[["top_logprobs"]]
+  # The chat endpoint, via the same adapter the OpenAI and Anthropic backends
+  # use. The legacy completion endpoint (`/api/generate`) returns an empty
+  # response for harmony-format reasoning models such as gpt-oss.
   state <- InProcessAgentMemory()
   append_message(
     state,
@@ -422,14 +391,19 @@ method(generate, OpenAI) <- function(
   request_body <- build_chat_request_body(
     x@config,
     state = state,
-    output_schema = output_schema %||% x@output_schema,
+    output_schema = output_schema,
     think = think,
     use_tools = FALSE,
     temperature = temperature,
     top_p = top_p,
     max_tokens = max_tokens,
     stop = stop,
-    seed = seed
+    top_k = top_k,
+    seed = seed,
+    num_ctx = num_ctx,
+    keep_alive = keep_alive,
+    logprobs = logprobs,
+    top_logprobs = top_logprobs
   )
   msg(repr_bracket(x@config@model_name), "working...", verbosity = verbosity)
   resp <- perform_chat_request(
@@ -439,7 +413,109 @@ method(generate, OpenAI) <- function(
   )
   msg(repr_bracket(x@config@model_name), "done.", verbosity = verbosity)
   res <- parse_chat_response(x@config, resp)
-  OpenAIMessage(
+  message <- OllamaMessage(
+    name = x@name,
+    content = res[["content"]],
+    metadata = res[["metadata"]],
+    model_name = x@config@model_name,
+    reasoning = res[["reasoning"]],
+    tool_calls = res[["tool_calls"]]
+  )
+  .validate_generated_message(
+    message,
+    output_schema,
+    validator,
+    on_validation_failure,
+    verbosity
+  )
+}
+
+
+# %% generate.OpenAI ----
+#' Generate method for OpenAI-compatible LLMs
+#'
+#' @param x OpenAI object.
+#' @param prompt Character: The prompt to send to the model.
+#' @param temperature Optional numeric \[0, 2\]: Per-call temperature override.
+#' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
+#' @param max_tokens Optional integer \[1, Inf): Maximum tokens to generate.
+#' @param stop Optional character: Stop sequence(s).
+#' @param think Optional logical: Whether to enable thinking options.
+#' @param output_schema Optional Schema: Per-call output schema override.
+#' @inheritParams generate
+#' @param verbosity Integer: Verbosity level.
+#' @param ... Additional per-call options: `seed` (integer), `logprobs` (logical),
+#' `top_logprobs` (integer).
+#'
+#' @return OpenAIMessage object
+#' @author EDG
+#'
+#' @noRd
+method(generate, OpenAI) <- function(
+  x,
+  prompt,
+  temperature = NULL,
+  top_p = NULL,
+  max_tokens = NULL,
+  stop = NULL,
+  think = NULL,
+  output_schema = NULL,
+  verbosity = 1L,
+  validate_output = TRUE,
+  on_validation_failure = c("warn", "collect", "abort"),
+  ...
+) {
+  on_validation_failure <- match.arg(on_validation_failure)
+  output_schema <- output_schema %||% x@output_schema
+  validator <- .prepare_output_validation(
+    output_schema,
+    validate_output,
+    on_validation_failure
+  )
+  check_inherits(prompt, "character")
+  extra <- list(...)
+  seed <- extra[["seed"]]
+  logprobs <- extra[["logprobs"]]
+  top_logprobs <- extra[["top_logprobs"]]
+  state <- InProcessAgentMemory()
+  append_message(
+    state,
+    SystemMessage(
+      name = x@name,
+      content = x@system_prompt
+    ),
+    echo = FALSE,
+    verbosity = 0L
+  )
+  append_message(
+    state,
+    InputMessage(content = prompt),
+    echo = FALSE,
+    verbosity = 0L
+  )
+  request_body <- build_chat_request_body(
+    x@config,
+    state = state,
+    output_schema = output_schema,
+    think = think,
+    use_tools = FALSE,
+    temperature = temperature,
+    top_p = top_p,
+    max_tokens = max_tokens,
+    stop = stop,
+    seed = seed,
+    logprobs = logprobs,
+    top_logprobs = top_logprobs
+  )
+  msg(repr_bracket(x@config@model_name), "working...", verbosity = verbosity)
+  resp <- perform_chat_request(
+    x@config,
+    request_body = request_body,
+    verbosity = verbosity
+  )
+  msg(repr_bracket(x@config@model_name), "done.", verbosity = verbosity)
+  res <- parse_chat_response(x@config, resp)
+  message <- OpenAIMessage(
     name = x@name,
     content = res[["content"]],
     metadata = res[["metadata"]],
@@ -447,6 +523,13 @@ method(generate, OpenAI) <- function(
     reasoning = res[["reasoning"]],
     tool_calls = res[["tool_calls"]],
     provider = .openai_provider_name(x@config)
+  )
+  .validate_generated_message(
+    message,
+    output_schema,
+    validator,
+    on_validation_failure,
+    verbosity
   )
 }
 
@@ -462,6 +545,7 @@ method(generate, OpenAI) <- function(
 #' @param stop Optional character: Stop sequence(s) (mapped to `stop_sequences`).
 #' @param think Optional logical: Whether to enable extended thinking for this call.
 #' @param output_schema Optional Schema: Per-call output schema override.
+#' @inheritParams generate
 #' @param verbosity Integer: Verbosity level.
 #' @param ... Additional per-call options: `top_k` (integer).
 #'
@@ -479,8 +563,17 @@ method(generate, Anthropic) <- function(
   think = NULL,
   output_schema = NULL,
   verbosity = 1L,
+  validate_output = TRUE,
+  on_validation_failure = c("warn", "collect", "abort"),
   ...
 ) {
+  on_validation_failure <- match.arg(on_validation_failure)
+  output_schema <- output_schema %||% x@output_schema
+  validator <- .prepare_output_validation(
+    output_schema,
+    validate_output,
+    on_validation_failure
+  )
   check_inherits(prompt, "character")
   extra <- list(...)
   top_k <- extra[["top_k"]]
@@ -503,7 +596,7 @@ method(generate, Anthropic) <- function(
   request_body <- build_chat_request_body(
     x@config,
     state = state,
-    output_schema = output_schema %||% x@output_schema,
+    output_schema = output_schema,
     think = think,
     use_tools = FALSE,
     temperature = temperature,
@@ -520,13 +613,20 @@ method(generate, Anthropic) <- function(
   )
   msg(repr_bracket(x@config@model_name), "done.", verbosity = verbosity)
   res <- parse_chat_response(x@config, resp)
-  AnthropicMessage(
+  message <- AnthropicMessage(
     name = x@name,
     content = res[["content"]],
     metadata = res[["metadata"]],
     model_name = x@config@model_name,
     reasoning = res[["reasoning"]],
     tool_calls = res[["tool_calls"]]
+  )
+  .validate_generated_message(
+    message,
+    output_schema,
+    validator,
+    on_validation_failure,
+    verbosity
   )
 }
 
@@ -542,7 +642,8 @@ method(generate, Anthropic) <- function(
 #' @param base_url Character: Base URL of Ollama server.
 #' @param think Optional Logical or Character \{"low", "medium", "high"\}: Default thinking mode
 #' for this config. Logical values target models like deepseek or qwen3; character values target
-#' gpt-oss. Can be overridden per call.
+#' gpt-oss. When `NULL`, the field is omitted from requests and Ollama uses the model default. Can
+#' be overridden per call.
 #'
 #' @return OllamaConfig object
 #'
@@ -583,6 +684,7 @@ config_Ollama <- function(
 #' @param base_url Character: Base URL of Ollama server.
 #' @param think Optional Logical or Character \{"low", "medium", "high"\}: Default thinking mode.
 #' Logical values target models like deepseek or qwen3; character values target gpt-oss.
+#' When `NULL`, the field is omitted from requests and Ollama uses the model default.
 #'
 #' @return Ollama LLM object
 #'
@@ -609,10 +711,10 @@ create_Ollama <- function(
   think = NULL
 ) {
   ollama_check_model(model_name)
-  check_scalar_character(system_prompt, "system_prompt")
-  check_optional_pos_double_scalar(temperature, "temperature")
-  check_optional_scalar_character(name, "name")
-  check_scalar_character(base_url, "base_url")
+  check_character_scalar(system_prompt, "system_prompt")
+  check_optional_nonneg_double_scalar(temperature, "temperature")
+  check_optional_character_scalar(name, "name")
+  check_character_scalar(base_url, "base_url")
   Ollama(
     name = name,
     config = OllamaConfig(
@@ -643,11 +745,17 @@ create_Ollama <- function(
 #' @param timeout Numeric (0, Inf): Request timeout in seconds.
 #' @param extra_headers Optional list: Additional HTTP headers.
 #' @param extra_body Optional list: Additional request body fields.
+#' @param zero_data_retention Optional logical: Whether to require OpenRouter to route each request
+#' only to a zero-data-retention endpoint. Supported only with an OpenRouter base URL.
 #' @param enable_thinking Optional logical: Whether to enable model thinking for compatible local
 #' servers.
 #' @param validate_model Logical: Whether to validate model availability using the models endpoint.
 #'
 #' @return OpenAIConfig object
+#'
+#' @details With `zero_data_retention = TRUE`, each OpenRouter request includes
+#' `provider.zdr = true`. OpenRouter will then consider only endpoints with a ZDR policy. This
+#' option does not activate account-level ZDR at OpenAI, Anthropic, or other providers.
 #'
 #' @author EDG
 #' @export
@@ -657,6 +765,14 @@ create_Ollama <- function(
 #'    model_name = "local-model",
 #'    temperature = 0.4,
 #'    base_url = "http://localhost:1234/v1/",
+#'    validate_model = FALSE
+#' )
+#' # Require an OpenRouter endpoint that does not retain prompts or responses:
+#' openrouter_cfg <- config_OpenAI(
+#'    model_name = "inclusionai/ling-3.0-flash-fin:free",
+#'    base_url = "https://openrouter.ai/api/v1",
+#'    api_key_env = "OPENROUTER_API_KEY",
+#'    zero_data_retention = TRUE,
 #'    validate_model = FALSE
 #' )
 config_OpenAI <- function(
@@ -671,12 +787,13 @@ config_OpenAI <- function(
   timeout = OPENAI_TIMEOUT_DEFAULT,
   extra_headers = NULL,
   extra_body = NULL,
+  zero_data_retention = NULL,
   enable_thinking = NULL,
   validate_model = FALSE
 ) {
-  check_scalar_character(model_name)
-  check_optional_pos_double_scalar(temperature, "temperature")
-  check_scalar_character(base_url, "base_url")
+  check_character_scalar(model_name)
+  check_optional_nonneg_double_scalar(temperature, "temperature")
+  check_character_scalar(base_url, "base_url")
   OpenAIConfig(
     model_name = model_name,
     temperature = temperature,
@@ -689,6 +806,7 @@ config_OpenAI <- function(
     timeout = timeout,
     extra_headers = extra_headers,
     extra_body = extra_body,
+    zero_data_retention = zero_data_retention,
     enable_thinking = enable_thinking,
     validate_model = validate_model
   )
@@ -712,11 +830,17 @@ config_OpenAI <- function(
 #' @param timeout Numeric (0, Inf): Request timeout in seconds.
 #' @param extra_headers Optional list: Additional HTTP headers.
 #' @param extra_body Optional list: Additional request body fields.
+#' @param zero_data_retention Optional logical: Whether to require OpenRouter to route each request
+#' only to a zero-data-retention endpoint. Supported only with an OpenRouter base URL.
 #' @param enable_thinking Optional logical: Whether to enable model thinking for compatible local
 #' servers.
 #' @param validate_model Logical: Whether to validate model availability using the models endpoint.
 #'
 #' @return OpenAI LLM object
+#'
+#' @details With `zero_data_retention = TRUE`, each OpenRouter request includes
+#' `provider.zdr = true`. OpenRouter will then consider only endpoints with a ZDR policy. This
+#' option does not activate account-level ZDR at OpenAI, Anthropic, or other providers.
 #'
 #' @author EDG
 #' @export
@@ -743,14 +867,15 @@ create_OpenAI <- function(
   timeout = OPENAI_TIMEOUT_DEFAULT,
   extra_headers = NULL,
   extra_body = NULL,
+  zero_data_retention = NULL,
   enable_thinking = NULL,
   validate_model = FALSE
 ) {
-  check_scalar_character(model_name)
-  check_scalar_character(system_prompt, "system_prompt")
-  check_optional_pos_double_scalar(temperature, "temperature")
-  check_optional_scalar_character(name, "name")
-  check_scalar_character(base_url, "base_url")
+  check_character_scalar(model_name)
+  check_character_scalar(system_prompt, "system_prompt")
+  check_optional_nonneg_double_scalar(temperature, "temperature")
+  check_optional_character_scalar(name, "name")
+  check_character_scalar(base_url, "base_url")
   OpenAI(
     name = name,
     config = config_OpenAI(
@@ -765,6 +890,7 @@ create_OpenAI <- function(
       timeout = timeout,
       extra_headers = extra_headers,
       extra_body = extra_body,
+      zero_data_retention = zero_data_retention,
       enable_thinking = enable_thinking,
       validate_model = validate_model
     ),
@@ -772,6 +898,124 @@ create_OpenAI <- function(
     output_schema = output_schema
   )
 } # /create_OpenAI
+
+
+# %% config_Apple ----
+#' Create an Apple Foundation Models Config Object
+#'
+#' Creates an AppleConfig object which can be passed to `create_agent()`.
+#'
+#' Apple's on-device Foundation Model (the model behind Apple Intelligence) is reached
+#' through the `rtemis-afm` bridge, which serves it over the OpenAI Chat Completions wire
+#' on `http://127.0.0.1:1977`. Install and start the bridge with
+#' `curl -fsSL https://live.rtemis.org/afm.sh | sh` (or
+#' `brew install rtemis-org/tap/rtemis-afm`, then `rtemis-afm`). It needs an Apple silicon
+#' Mac, macOS 27 or later, and Apple Intelligence turned on. No API key is used or sent.
+#'
+#' The model supports chat, structured output, and tool calling, with an 8,192-token
+#' context window on macOS 27.0; a prompt that does not fit is refused by the bridge with
+#' a `context_length_exceeded` error.
+#'
+#' @param temperature Numeric \[0, 2\]: The temperature for the model.
+#' @param model_name Character: The model id the bridge serves; `"afm"` unless the bridge says
+#' otherwise.
+#' @param base_url Character: Base URL of the bridge's OpenAI-compatible wire.
+#' @param timeout Numeric (0, Inf): Request timeout in seconds.
+#' @param extra_headers Optional list: Additional HTTP headers.
+#' @param extra_body Optional list: Additional request body fields.
+#' @param validate_model Logical: Whether to check the bridge's `/health` endpoint now with
+#' [apple_check_available], so that a bridge that is not running or a model that is not
+#' available fails here with a message saying what to do, rather than at the first request.
+#'
+#' @return AppleConfig object
+#'
+#' @author EDG
+#' @export
+#'
+#' @examples
+#' # Requires a running rtemis-afm bridge
+#' \dontrun{
+#'   cfg <- config_Apple(temperature = 0.2)
+#'   agent <- create_agent(cfg, system_prompt = "You are a concise assistant.")
+#' }
+#' # Build the configuration without contacting the bridge:
+#' cfg <- config_Apple(validate_model = FALSE)
+config_Apple <- function(
+  temperature = TEMPERATURE_DEFAULT,
+  model_name = APPLE_MODEL_DEFAULT,
+  base_url = APPLE_URL_DEFAULT,
+  timeout = APPLE_TIMEOUT_DEFAULT,
+  extra_headers = NULL,
+  extra_body = NULL,
+  validate_model = TRUE
+) {
+  check_optional_nonneg_double_scalar(temperature, "temperature")
+  check_character_scalar(model_name, "model_name")
+  check_character_scalar(base_url, "base_url")
+  AppleConfig(
+    model_name = model_name,
+    temperature = temperature,
+    base_url = base_url,
+    timeout = timeout,
+    extra_headers = extra_headers,
+    extra_body = extra_body,
+    validate_model = validate_model
+  )
+} # /config_Apple
+
+
+# %% create_Apple ----
+#' Create an Apple Foundation Models LLM Object
+#'
+#' A stateless LLM backed by Apple's on-device Foundation Model through the `rtemis-afm`
+#' bridge; see [config_Apple] for what the bridge is and how to start it.
+#'
+#' @inheritParams config_Apple
+#' @param system_prompt Character: The system prompt to use.
+#' @param output_schema Optional Schema: Output schema created using [schema].
+#' @param name Optional character: Name for the LLM object.
+#'
+#' @return Apple LLM object
+#'
+#' @author EDG
+#' @export
+#'
+#' @examples
+#' # Requires a running rtemis-afm bridge
+#' \dontrun{
+#'   llm <- create_Apple(system_prompt = "You are a meticulous research assistant.")
+#'   generate(llm, "What is the capital of France?")
+#' }
+create_Apple <- function(
+  system_prompt = SYSTEM_PROMPT_DEFAULT,
+  temperature = TEMPERATURE_DEFAULT,
+  output_schema = NULL,
+  name = NULL,
+  model_name = APPLE_MODEL_DEFAULT,
+  base_url = APPLE_URL_DEFAULT,
+  timeout = APPLE_TIMEOUT_DEFAULT,
+  extra_headers = NULL,
+  extra_body = NULL,
+  validate_model = TRUE
+) {
+  check_character_scalar(system_prompt, "system_prompt")
+  check_optional_nonneg_double_scalar(temperature, "temperature")
+  check_optional_character_scalar(name, "name")
+  Apple(
+    name = name,
+    config = config_Apple(
+      temperature = temperature,
+      model_name = model_name,
+      base_url = base_url,
+      timeout = timeout,
+      extra_headers = extra_headers,
+      extra_body = extra_body,
+      validate_model = validate_model
+    ),
+    system_prompt = system_prompt,
+    output_schema = output_schema
+  )
+} # /create_Apple
 
 
 # %% config_Anthropic ----
@@ -827,9 +1071,9 @@ config_Anthropic <- function(
   thinking_budget_tokens = NULL,
   validate_model = FALSE
 ) {
-  check_scalar_character(model_name)
-  check_optional_pos_double_scalar(temperature, "temperature")
-  check_scalar_character(base_url, "base_url")
+  check_character_scalar(model_name)
+  check_optional_nonneg_double_scalar(temperature, "temperature")
+  check_character_scalar(base_url, "base_url")
   AnthropicConfig(
     model_name = model_name,
     temperature = temperature,
@@ -902,11 +1146,11 @@ create_Anthropic <- function(
   thinking_budget_tokens = NULL,
   validate_model = FALSE
 ) {
-  check_scalar_character(model_name)
-  check_scalar_character(system_prompt, "system_prompt")
-  check_optional_pos_double_scalar(temperature, "temperature")
-  check_optional_scalar_character(name, "name")
-  check_scalar_character(base_url, "base_url")
+  check_character_scalar(model_name)
+  check_character_scalar(system_prompt, "system_prompt")
+  check_optional_nonneg_double_scalar(temperature, "temperature")
+  check_optional_character_scalar(name, "name")
+  check_character_scalar(base_url, "base_url")
   Anthropic(
     name = name,
     config = config_Anthropic(

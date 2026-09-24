@@ -1,0 +1,72 @@
+# rtemis.llm NEWS
+
+## 0.8.7
+
+- Added `config_Apple()` and `create_Apple()` for Apple Foundation Models: Apple's
+  on-device model, served over the OpenAI Chat Completions wire by the `rtemis-afm`
+  bridge on `http://127.0.0.1:1977`. `AppleConfig` is an `OpenAIConfig`, so chat,
+  structured output, tool calling, agents, and batch generation work unchanged; no API
+  key is resolved or sent. `config_Apple()` reads the bridge's `/health` endpoint by
+  default and stops with instructions when the bridge is not running or the model is
+  unavailable (`validate_model = FALSE` skips the check). `apple_health()` returns the
+  served model, its availability, and its context window; `apple_check_available()`
+  performs the check on its own.
+
+## 0.8.6
+
+- Added `items` to `field()`: an `"array"` field now says what it contains, as a type
+  name (`items = "string"`), a `field()` where the elements carry their own description
+  or `enum`, or a `schema()` for an array of objects. Emitted as the JSON Schema `items`
+  key and passed through by all three backends, so a list of values can be requested as
+  a list instead of as one delimited string the caller splits back apart.
+- An `"array"` field declared without `items` is now an error rather than a schema that
+  fails at request time: OpenAI's strict mode rejects an array with no element type, and
+  a constrained-decoding backend has nothing to constrain. `items` on any other type is
+  likewise refused.
+- `field()` refuses `type = "object"`: a field carries no properties, which OpenAI and
+  Anthropic require of an object schema. Declare an array of objects with
+  `type = "array"` and `items = schema(...)`. `tool_param()` still accepts `"object"`.
+- `validate_output()` checks array elements against `items`, where before an array field
+  constrained only its outer type.
+
+## 0.8.5
+
+- Structured responses are validated locally by default with a cached Ajv validator.
+  `validate_output = FALSE` skips validation while still requesting the schema.
+  `on_validation_failure = "warn"` retains invalid output and emits an informational
+  rtemis.core message, not an R warning; `"collect"` is silent and `"abort"` raises
+  an error carrying the response and diagnostics. Batches validate per item and
+  summarize mismatches once at completion.
+- Added standalone `validate_output()` and the `validation_results()` accessor.
+  Reports preserve original text, input positions/names, statuses, and diagnostics,
+  including when batch responses are extracted. Validation does not repair output.
+- Agent final answers are validated before memory commit. `responses()` recognizes
+  histories returned by `generate(agent, ...)` and extracts their final answer.
+- Anthropic synthetic structured-output tool inputs are returned as answer JSON,
+  retaining raw content metadata and excluding the synthetic tool from execution.
+- Added `enum` to `field()`: restrict a field to a fixed set of permitted values. Emitted as the
+  JSON Schema `enum` key and passed through unchanged by all three backends, so a backend with
+  constrained decoding (Ollama) makes an invalid value impossible rather than merely detectable.
+- Added `on_error` to `llmapply()`, `agentapply()`, and `map()`, defaulting to `"na"`: a failed
+  call now warns and yields `NA` rather than discarding every result in the batch, and the result
+  carries an `errors` attribute (a data.frame of `index` and `message`) for retrying just the
+  failures. Pass `on_error = "abort"` for the previous behavior of propagating the first error.
+- `responses()` and `reasoning()` now accept `NULL` elements, mapping them to `NA_character_`.
+- Added `num_ctx` and `keep_alive` as per-call Ollama options in `generate()`.
+- Added `logprobs` and `top_logprobs` per-call options for the Ollama and OpenAI-compatible
+  backends, with new `logprobs()` and `token_probs()` accessors. `token_probs()` reads the
+  probability of each candidate answer straight off the model's token distribution, which is
+  better calibrated than asking a model to emit a number. Anthropic does not return log
+  probabilities; its messages yield `NULL` rather than an error.
+- Per-call options passed to `generate()` (`temperature`, `top_p`, `max_tokens`, `stop`,
+  `top_k`, `seed`, `num_ctx`, `keep_alive`, `logprobs`, `top_logprobs`) are validated against
+  each backend's documented bounds before a request is built, so an out-of-range or wrong-typed
+  value fails locally instead of on the server. Bounds follow the backend: `temperature` accepts
+  up to 2 on Ollama and OpenAI-compatible backends and up to 1 on Anthropic, and `top_logprobs`
+  up to 20 on OpenAI. `top_logprobs` requires `logprobs = TRUE`, which every backend that
+  returns alternatives needs in order to return them.
+
+## 0.8.4
+
+- Added `zero_data_retention` to `config_OpenAI()` and `create_OpenAI()` for per-request OpenRouter ZDR routing.
+- Added `think` to `config_Ollama()`, `create_Ollama()`, and `generate()` for Ollama thinking control.

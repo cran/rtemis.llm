@@ -1,4 +1,7 @@
-[![R CI](https://github.com/rtemis-org/llm/actions/workflows/r-ci-r2u.yml/badge.svg)](https://github.com/rtemis-org/llm/actions/workflows/r-ci-r2u.yml) [![rtemis.llm status badge](https://rtemis-org.r-universe.dev/rtemis.llm/badges/version)](https://rtemis-org.r-universe.dev/rtemis.llm) [![Docs](https://img.shields.io/badge/docs-rtemis.org/r-blue)](https://docs.rtemis.org/r/llm/)
+[![CRAN status](https://www.r-pkg.org/badges/version/rtemis.llm)](https://CRAN.R-project.org/package=rtemis.llm)
+[![rtemis.llm status badge](https://rtemis-org.r-universe.dev/rtemis.llm/badges/version)](https://rtemis-org.r-universe.dev/rtemis.llm)
+[![R CI](https://github.com/rtemis-org/llm/actions/workflows/r-ci-r2u.yml/badge.svg)](https://github.com/rtemis-org/llm/actions/workflows/r-ci-r2u.yml)
+[![R-Docs](https://img.shields.io/badge/docs-rtemis.org/r-blue)](https://docs.rtemis.org/r/llm/)
 
 # rtemis.llm R package
 
@@ -6,7 +9,8 @@ Unified interface for creating **`LLM`** and **`Agent`** objects, generating res
 performing batch inference.  
 Built on a type-checked and validated '**S7**' backend.  
 Features **reasoning**, **structured output**, **memory management**, and **tool use**.  
-Supports **Ollama**, **OpenAI**-compatible, and **Anthropic**-compatible endpoints.
+Supports **Ollama**, **OpenAI**-compatible, and **Anthropic**-compatible endpoints, and
+**Apple Foundation Models** on-device through the [rtemis-afm](https://github.com/rtemis-org/rtemis-afm) bridge.
 
 ## Features
 
@@ -20,7 +24,25 @@ Supports **Ollama**, **OpenAI**-compatible, and **Anthropic**-compatible endpoin
 
 ## Installation
 
+### CRAN
+
+```{r}
+install.packages("rtemis.llm")
+```
+
+or
+
+```{r}
+pak::pak("rtemis.llm")
+```
+
 ### R-universe
+
+```{r}
+install.packages("rtemis.llm", repos = "https://rtemis-org.r-universe.dev")
+```
+
+or
 
 ```r
 pak::repo_add(myuniverse = "https://rtemis-org.r-universe.dev")
@@ -83,3 +105,58 @@ agent <- create_agent(
 ```r
 generate(agent, "Explain quantum superposition in seven bullet points.")
 ```
+
+### Apple Foundation Models
+
+On an Apple silicon Mac with macOS 27 and Apple Intelligence turned on, the on-device
+model is served by the [rtemis-afm](https://github.com/rtemis-org/rtemis-afm) bridge.
+Install and start it once in a terminal (`curl -fsSL https://live.rtemis.org/afm.sh | sh`,
+or `brew install rtemis-org/tap/rtemis-afm` then `rtemis-afm`); no API key is needed.
+
+```r
+llm <- create_Apple(system_prompt = "You are a meticulous research assistant.")
+generate(llm, "What is the role of the telomere?")
+
+agent <- create_agent(config_Apple(), tools = list(tool_datetime))
+generate(agent, "What is the date today?")
+```
+
+`config_Apple()` checks the bridge's health first and says what to do if it is not
+running or the model is unavailable; `apple_health()` reports the served model and its
+context window (8,192 tokens on macOS 27.0).
+
+### Structured output validation
+
+Validation runs locally when an output schema is supplied. Invalid output is
+retained by default, with an informational message through `rtemis.core::warn()`
+(not an R warning). This applies to single responses and batches, including small
+local models that may not reliably follow schemas.
+
+```r
+sch <- schema("Count", field("n", type = "integer"))
+out <- llmapply(
+  c("How many days are in a week?", "How many months are in a year?"),
+  "gemma4:e4b",
+  output_schema = sch
+)
+report <- validation_results(out)
+report@status   # valid, invalid, unavailable, or not_validated
+report@issues   # input index, JSON path, keyword, and diagnostic message
+```
+
+Set `on_validation_failure = "collect"` to record diagnostics silently, or
+`"abort"` to raise an error on a mismatch. Batch validation occurs per response;
+the default logs a single summary. Validation aborts follow the batch's `on_error`
+policy, with rejected text retained in the validation report.
+
+You can also generate with `validate_output = FALSE` and validate later, or check
+any saved JSON directly:
+
+```r
+report <- validate_output(c('{"n":10}', '{"n":"10"}'), sch)
+report@status  # "valid" "invalid"
+```
+
+Validation checks the requested schema without coercing values, stripping Markdown,
+or repairing JSON. Current schemas allow extra properties, optional fields permit
+omission but not null, and array/object fields constrain only the outer type.

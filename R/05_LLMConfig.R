@@ -4,6 +4,7 @@
 # Tool calling: https://docs.ollama.com/capabilities/tool-calling#tool-calling
 # OpenAI API: https://developers.openai.com/api/reference/overview
 # Anthropic API: https://platform.claude.com/docs/en/api/getting-started
+# Apple Foundation Models, through the rtemis-afm bridge: https://github.com/rtemis-org/rtemis-afm
 
 # %% Constants ----
 TEMPERATURE_DEFAULT <- 0.3
@@ -19,6 +20,13 @@ ANTHROPIC_API_VERSION_DEFAULT <- "2023-06-01"
 ANTHROPIC_MAX_TOKENS_DEFAULT <- 4096L
 ANTHROPIC_TIMEOUT_DEFAULT <- 60
 ANTHROPIC_THINKING_MIN_BUDGET <- 1024L
+# rtemis-afm serves Apple's on-device model over the OpenAI wire on loopback; the
+# model id is fixed at "afm" so a stored configuration survives a macOS update
+# that renames the variant (spec: rtemis-afm/wire#get-v1models).
+APPLE_URL_DEFAULT <- "http://127.0.0.1:1977/v1"
+APPLE_MODEL_DEFAULT <- "afm"
+APPLE_TIMEOUT_DEFAULT <- 60
+APPLE_PROVIDER_NAME <- "Apple Foundation Models"
 
 
 # --- Internal API ---------------------------------------------------------------------------------
@@ -38,10 +46,14 @@ ANTHROPIC_THINKING_MIN_BUDGET <- 1024L
 LLMConfig <- new_class(
   "LLMConfig",
   properties = list(
-    model_name = character_scalar,
-    temperature = class_numeric,
-    backend = character_scalar,
-    base_url = character_scalar
+    model_name = prop_string(description = "Model name"),
+    temperature = prop_float(
+      min = 0,
+      max = 2,
+      description = "Sampling temperature"
+    ),
+    backend = prop_string(description = "Backend name"),
+    base_url = prop_string(description = "API base URL")
   ),
   constructor = function(
     model_name,
@@ -49,11 +61,7 @@ LLMConfig <- new_class(
     backend,
     base_url
   ) {
-    # --- Validate inputs ---
-    # Temperature must be numeric between 0.0 and 2.0
-    if (temperature < 0.0 || temperature > 2.0) {
-      cli::cli_abort("{.var temperature} must be between 0.0 and 2.0.")
-    }
+    # `temperature`'s bounds are carried by its property declaration.
     new_object(
       S7_object(),
       model_name = model_name,
@@ -154,17 +162,40 @@ OpenAIConfig <- new_class(
   "OpenAIConfig",
   parent = LLMConfig,
   properties = list(
-    temperature = bounded_double_property(0, 2),
-    api_key = optional_character_scalar,
-    api_key_env = character_scalar,
-    keychain_service = optional_character_scalar,
-    organization = optional_character_scalar,
-    project = optional_character_scalar,
-    timeout = class_numeric,
-    extra_headers = optional(S7::class_list),
-    extra_body = optional(S7::class_list),
-    enable_thinking = optional(S7::class_logical),
-    validate_model = class_logical
+    temperature = prop_float(
+      min = 0,
+      max = 2,
+      description = "Sampling temperature"
+    ),
+    api_key = prop_string(nullable = TRUE, description = "API key"),
+    api_key_env = prop_string(
+      description = "Environment variable holding the API key"
+    ),
+    keychain_service = prop_string(
+      nullable = TRUE,
+      description = "Keychain service holding the API key"
+    ),
+    organization = prop_string(nullable = TRUE, description = "Organization"),
+    project = prop_string(nullable = TRUE, description = "Project"),
+    timeout = prop_float(
+      exclusive_min = 0,
+      description = "Request timeout (seconds)"
+    ),
+    extra_headers = prop_bag(description = "Extra HTTP headers"),
+    extra_body = prop_bag(description = "Extra request body fields"),
+    zero_data_retention = prop_boolean(
+      default = NULL,
+      nullable = TRUE,
+      description = "Require OpenRouter zero-data-retention routing"
+    ),
+    enable_thinking = prop_boolean(
+      nullable = TRUE,
+      description = "Enable reasoning"
+    ),
+    validate_model = prop_boolean(
+      default = NULL,
+      description = "Check the model name against the endpoint"
+    )
   ),
   constructor = function(
     model_name,
@@ -178,47 +209,58 @@ OpenAIConfig <- new_class(
     timeout = OPENAI_TIMEOUT_DEFAULT,
     extra_headers = NULL,
     extra_body = NULL,
+    zero_data_retention = NULL,
     enable_thinking = NULL,
     validate_model = FALSE
   ) {
-    check_scalar_character(model_name, "model_name")
-    check_scalar_character(base_url, "base_url")
+    check_character_scalar(model_name, "model_name")
+    check_character_scalar(base_url, "base_url")
     if (!is.null(api_key)) {
-      check_scalar_character(api_key, "api_key")
+      check_character_scalar(api_key, "api_key")
     }
-    check_scalar_character(api_key_env, "api_key_env")
+    check_character_scalar(api_key_env, "api_key_env")
     if (!is.null(keychain_service)) {
-      check_scalar_character(keychain_service, "keychain_service")
+      check_character_scalar(keychain_service, "keychain_service")
     }
     if (!is.null(organization)) {
-      check_scalar_character(organization, "organization")
+      check_character_scalar(organization, "organization")
     }
     if (!is.null(project)) {
-      check_scalar_character(project, "project")
+      check_character_scalar(project, "project")
     }
     if (length(timeout) != 1L || is.na(timeout) || timeout <= 0) {
-      cli::cli_abort("{.var timeout} must be a positive numeric scalar.")
+      abort("`timeout` must be a positive numeric scalar.")
     }
     if (!is.null(extra_headers) && !.is_named_list(extra_headers)) {
-      cli::cli_abort(
-        "{.var extra_headers} must be a named list or {.val NULL}."
-      )
+      abort("`extra_headers` must be a named list or NULL.")
     }
     if (!is.null(extra_body) && !.is_named_list(extra_body)) {
-      cli::cli_abort("{.var extra_body} must be a named list or {.val NULL}.")
+      abort("`extra_body` must be a named list or NULL.")
     }
+    check_optional_logical_scalar(
+      zero_data_retention,
+      "zero_data_retention"
+    )
     if (
       !is.null(enable_thinking) &&
         (length(enable_thinking) != 1L || is.na(enable_thinking))
     ) {
-      cli::cli_abort(
-        "{.var enable_thinking} must be a logical scalar or {.val NULL}."
+      abort("`enable_thinking` must be a logical scalar or NULL.")
+    }
+    check_logical_scalar(validate_model, "validate_model")
+    base_url <- .clean_base_url(base_url)
+    if (
+      isTRUE(zero_data_retention) &&
+        !grepl(
+          "^https://(openrouter\\.ai|eu\\.openrouter\\.ai)(:[0-9]+)?(/|$)",
+          base_url
+        )
+    ) {
+      abort(
+        "`zero_data_retention = TRUE` is only supported for OpenRouter requests.\n",
+        "Use an OpenRouter base URL, or configure ZDR in the provider account/workspace."
       )
     }
-    if (length(validate_model) != 1L || is.na(validate_model)) {
-      cli::cli_abort("{.var validate_model} must be a logical scalar.")
-    }
-    base_url <- .clean_base_url(base_url)
     if (validate_model) {
       openai_check_model(
         x = model_name,
@@ -245,11 +287,87 @@ OpenAIConfig <- new_class(
       timeout = timeout,
       extra_headers = extra_headers,
       extra_body = extra_body,
+      zero_data_retention = zero_data_retention,
       enable_thinking = enable_thinking,
       validate_model = validate_model
     )
   }
 )
+
+
+# %% AppleConfig ----
+#' @title AppleConfig Class
+#'
+#' @description
+#' Apple Foundation Models configuration class: an `OpenAIConfig` for the
+#' `rtemis-afm` bridge, which serves Apple's on-device model over the OpenAI
+#' Chat Completions wire on loopback. Every `OpenAIConfig` method applies
+#' unchanged; the constructor fixes what the bridge fixes (the backend name,
+#' the model id, the loopback URL) and carries no API key, so nothing found
+#' in the environment is ever sent to the local server.
+#'
+#' @author EDG
+#' @noRd
+AppleConfig <- new_class(
+  "AppleConfig",
+  parent = OpenAIConfig,
+  constructor = function(
+    model_name = APPLE_MODEL_DEFAULT,
+    temperature = TEMPERATURE_DEFAULT,
+    base_url = APPLE_URL_DEFAULT,
+    timeout = APPLE_TIMEOUT_DEFAULT,
+    extra_headers = NULL,
+    extra_body = NULL,
+    validate_model = TRUE
+  ) {
+    check_character_scalar(model_name, "model_name")
+    check_character_scalar(base_url, "base_url")
+    check_logical_scalar(validate_model, "validate_model")
+    # The parent constructor validates the shared arguments; its own model
+    # check is skipped because /health says why a model is unavailable and
+    # /v1/models does not (spec: llm/apple#health).
+    config <- OpenAIConfig(
+      model_name = model_name,
+      temperature = temperature,
+      base_url = base_url,
+      timeout = timeout,
+      extra_headers = extra_headers,
+      extra_body = extra_body,
+      validate_model = FALSE
+    )
+    if (validate_model) {
+      apple_check_available(base_url = config@base_url)
+    }
+    new_object(
+      config,
+      backend = "apple",
+      validate_model = validate_model
+    )
+  }
+)
+
+
+# %% as_list.AppleConfig ----
+#' as_list method for AppleConfig
+#'
+#' @param x AppleConfig object.
+#'
+#' @return List representation of AppleConfig.
+#'
+#' @author EDG
+#' @noRd
+method(as_list, AppleConfig) <- function(x) {
+  list(
+    model_name = x@model_name,
+    temperature = x@temperature,
+    backend = x@backend,
+    base_url = x@base_url,
+    timeout = x@timeout,
+    extra_headers = x@extra_headers,
+    extra_body = x@extra_body,
+    validate_model = x@validate_model
+  )
+} # /as_list.AppleConfig
 
 
 # %% AnthropicConfig ----
@@ -264,18 +382,43 @@ AnthropicConfig <- new_class(
   "AnthropicConfig",
   parent = LLMConfig,
   properties = list(
-    temperature = prob_scalar,
-    api_key = optional_character_scalar,
-    api_key_env = character_scalar,
-    keychain_service = optional_character_scalar,
-    anthropic_version = character_scalar,
-    anthropic_beta = optional_character_scalar,
-    max_tokens = class_integer,
-    timeout = class_numeric,
-    extra_headers = optional(S7::class_list),
-    extra_body = optional(S7::class_list),
-    thinking_budget_tokens = optional(S7::class_integer),
-    validate_model = class_logical
+    temperature = prop_float(
+      min = 0,
+      max = 1,
+      description = "Sampling temperature"
+    ),
+    api_key = prop_string(nullable = TRUE, description = "API key"),
+    api_key_env = prop_string(
+      description = "Environment variable holding the API key"
+    ),
+    keychain_service = prop_string(
+      nullable = TRUE,
+      description = "Keychain service holding the API key"
+    ),
+    anthropic_version = prop_string(description = "Anthropic API version"),
+    anthropic_beta = prop_string(
+      nullable = TRUE,
+      description = "Anthropic beta feature header"
+    ),
+    max_tokens = prop_integer(
+      min = 1L,
+      description = "Maximum tokens to generate"
+    ),
+    timeout = prop_float(
+      exclusive_min = 0,
+      description = "Request timeout (seconds)"
+    ),
+    extra_headers = prop_bag(description = "Extra HTTP headers"),
+    extra_body = prop_bag(description = "Extra request body fields"),
+    thinking_budget_tokens = prop_integer(
+      nullable = TRUE,
+      min = 1L,
+      description = "Token budget for extended thinking"
+    ),
+    validate_model = prop_boolean(
+      default = NULL,
+      description = "Check the model name against the endpoint"
+    )
   ),
   constructor = function(
     model_name,
@@ -293,16 +436,16 @@ AnthropicConfig <- new_class(
     thinking_budget_tokens = NULL,
     validate_model = FALSE
   ) {
-    check_scalar_character(model_name, "model_name")
-    check_scalar_character(base_url, "base_url")
+    check_character_scalar(model_name, "model_name")
+    check_character_scalar(base_url, "base_url")
     if (!is.null(api_key)) {
-      check_scalar_character(api_key, "api_key")
+      check_character_scalar(api_key, "api_key")
     }
-    check_scalar_character(api_key_env, "api_key_env")
+    check_character_scalar(api_key_env, "api_key_env")
     if (!is.null(keychain_service)) {
-      check_scalar_character(keychain_service, "keychain_service")
+      check_character_scalar(keychain_service, "keychain_service")
     }
-    check_scalar_character(anthropic_version, "anthropic_version")
+    check_character_scalar(anthropic_version, "anthropic_version")
     if (!is.null(anthropic_beta)) {
       if (
         !is.character(anthropic_beta) ||
@@ -310,8 +453,8 @@ AnthropicConfig <- new_class(
           any(is.na(anthropic_beta)) ||
           any(!nzchar(trimws(anthropic_beta)))
       ) {
-        cli::cli_abort(
-          "{.var anthropic_beta} must be a non-empty character vector or {.val NULL}."
+        abort(
+          "`anthropic_beta` must be a non-empty character vector or NULL."
         )
       }
     }
@@ -322,21 +465,17 @@ AnthropicConfig <- new_class(
         max_tokens <= 0 ||
         max_tokens != as.integer(max_tokens)
     ) {
-      cli::cli_abort(
-        "{.var max_tokens} must be a positive integer-coercible scalar."
-      )
+      abort("`max_tokens` must be a positive integer-coercible scalar.")
     }
     max_tokens <- as.integer(max_tokens)
     if (length(timeout) != 1L || is.na(timeout) || timeout <= 0) {
-      cli::cli_abort("{.var timeout} must be a positive numeric scalar.")
+      abort("`timeout` must be a positive numeric scalar.")
     }
     if (!is.null(extra_headers) && !.is_named_list(extra_headers)) {
-      cli::cli_abort(
-        "{.var extra_headers} must be a named list or {.val NULL}."
-      )
+      abort("`extra_headers` must be a named list or NULL.")
     }
     if (!is.null(extra_body) && !.is_named_list(extra_body)) {
-      cli::cli_abort("{.var extra_body} must be a named list or {.val NULL}.")
+      abort("`extra_body` must be a named list or NULL.")
     }
     if (!is.null(thinking_budget_tokens)) {
       if (
@@ -345,21 +484,23 @@ AnthropicConfig <- new_class(
           !is.numeric(thinking_budget_tokens) ||
           thinking_budget_tokens != as.integer(thinking_budget_tokens)
       ) {
-        cli::cli_abort(
-          "{.var thinking_budget_tokens} must be a positive integer-coercible scalar or {.val NULL}."
+        abort(
+          "`thinking_budget_tokens` must be a positive integer-coercible scalar or NULL."
         )
       }
       thinking_budget_tokens <- as.integer(thinking_budget_tokens)
       if (thinking_budget_tokens < ANTHROPIC_THINKING_MIN_BUDGET) {
-        cli::cli_abort(c(
-          "{.var thinking_budget_tokens} must be at least {.val {ANTHROPIC_THINKING_MIN_BUDGET}}.",
-          i = "Extended thinking requires a minimum budget of {ANTHROPIC_THINKING_MIN_BUDGET} tokens."
-        ))
+        abort(
+          "`thinking_budget_tokens` must be at least ",
+          ANTHROPIC_THINKING_MIN_BUDGET,
+          ".\n",
+          "Extended thinking requires a minimum budget of ",
+          ANTHROPIC_THINKING_MIN_BUDGET,
+          " tokens."
+        )
       }
     }
-    if (length(validate_model) != 1L || is.na(validate_model)) {
-      cli::cli_abort("{.var validate_model} must be a logical scalar.")
-    }
+    check_logical_scalar(validate_model, "validate_model")
     base_url <- .clean_base_url(base_url)
     if (validate_model) {
       anthropic_check_model(
@@ -449,6 +590,7 @@ method(as_list, OpenAIConfig) <- function(x) {
     timeout = x@timeout,
     extra_headers = x@extra_headers,
     extra_body = x@extra_body,
+    zero_data_retention = x@zero_data_retention,
     enable_thinking = x@enable_thinking,
     validate_model = x@validate_model
   )

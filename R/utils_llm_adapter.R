@@ -26,21 +26,26 @@ method(build_chat_messages, OllamaConfig) <- function(x, state) {
 #' @keywords internal
 #' @noRd
 method(build_chat_messages, OpenAIConfig) <- function(x, state) {
-  lapply(
+  # `get_messages()` names the list by role for readable inspection, and
+  # `lapply()` preserves those names, which `toJSON()` then emits as an object
+  # keyed by role instead of the array the API requires -- a 400 on every
+  # request. `get_message_list()` unnames for the same reason on the Ollama
+  # path; this adapter builds its own list and must do it too.
+  unname(lapply(
     get_messages(state),
     function(msg) {
       if (S7_inherits(msg, InputMessage) && !is.null(msg@image_path)) {
-        cli::cli_abort(c(
-          "OpenAI-compatible image inputs are not implemented yet.",
-          i = "Use a text-only prompt or add a provider-specific image adapter first."
-        ))
+        abort(
+          "OpenAI-compatible image inputs are not implemented yet.\n",
+          "Use a text-only prompt or add a provider-specific image adapter first."
+        )
       }
       if (S7_inherits(msg, ToolMessage)) {
         if (is.null(msg@tool_call_id)) {
-          cli::cli_abort(c(
-            "OpenAI-compatible tool messages require {.field tool_call_id}.",
-            i = "Use provider adapter tool handling to append tool responses."
-          ))
+          abort(
+            "OpenAI-compatible tool messages require `tool_call_id`.\n",
+            "Use provider adapter tool handling to append tool responses."
+          )
         }
         return(list(
           role = msg@role,
@@ -57,7 +62,7 @@ method(build_chat_messages, OpenAIConfig) <- function(x, state) {
       }
       out
     }
-  )
+  ))
 }
 
 
@@ -112,6 +117,144 @@ method(build_response_format, OpenAIConfig) <- function(
 }
 
 
+# %% .check_keep_alive() ----
+#' Validate the Ollama keep_alive Argument
+#'
+#' Ollama accepts either a duration string such as `"10m"` or a number of
+#' seconds, where a negative value means "keep the model loaded indefinitely".
+#' A union of two types with a backend-specific meaning, so it stays here rather
+#' than in rtemis.core alongside the general-purpose checks.
+#'
+#' @param x Object: Value to validate, or `NULL`.
+#' @param arg_name Character: Argument name to report in error messages.
+#'
+#' @return NULL, invisibly.
+#'
+#' @author EDG
+#' @keywords internal
+#' @noRd
+.check_keep_alive <- function(x, arg_name = "keep_alive") {
+  if (is.null(x)) {
+    return(invisible(NULL))
+  }
+  valid <- length(x) == 1L &&
+    !is.na(x) &&
+    (is.character(x) || is.numeric(x))
+  if (!valid) {
+    abort(
+      "`",
+      arg_name,
+      "` must be a duration string such as \"10m\", or a number of seconds."
+    )
+  }
+  invisible(NULL)
+}
+# /.check_keep_alive
+
+# %% .check_logprobs_args() ----
+#' Validate the logprobs Argument Pair
+#'
+#' `top_logprobs` asks for alternatives at each position, which a backend only
+#' returns alongside the token log probabilities themselves. Sent on its own it
+#' fails late and differently per backend: OpenAI rejects the request outright,
+#' while Ollama drops the field and returns a response with no logprobs at all,
+#' so `logprobs()` and `token_probs()` come back empty with nothing to explain
+#' why. Both are reported here instead, before the call is paid for.
+#'
+#' @param logprobs Object: Value of the `logprobs` argument.
+#' @param top_logprobs Object: Value of the `top_logprobs` argument.
+#'
+#' @return NULL, invisibly.
+#'
+#' @author EDG
+#' @keywords internal
+#' @noRd
+.check_logprobs_args <- function(logprobs, top_logprobs) {
+  if (is.null(top_logprobs) || isTRUE(logprobs)) {
+    return(invisible(NULL))
+  }
+  abort(
+    "`top_logprobs` requires `logprobs = TRUE`.\n",
+    "Alternative tokens are only returned alongside the log probabilities ",
+    "of the generated tokens."
+  )
+}
+# /.check_logprobs_args
+
+# %% .check_call_options() ----
+#' Validate Per-Call Request Options
+#'
+#' Every per-call knob a caller can pass to `generate()` reaches the request
+#' builders through `...`, so nothing between the user and the wire has checked
+#' it: the config classes validate their own defaults via `prop_*()`, but an
+#' override supplied at call time bypasses those declarations entirely. Each
+#' argument is checked here against the same bounds its config property
+#' carries, before a request is built and paid for.
+#'
+#' Backends that disagree on a bound take it as an argument: `temperature` is
+#' capped at 2 by Ollama and OpenAI but at 1 by Anthropic, and `top_logprobs`
+#' is capped at 20 by OpenAI but unbounded by Ollama.
+#'
+#' @param temperature Optional numeric: Sampling temperature.
+#' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
+#' @param max_tokens Optional integer \[1, Inf): Maximum tokens to generate.
+#' @param stop Optional character: Stop sequence(s).
+#' @param top_k Optional integer \[1, Inf): Top-K sampling cutoff.
+#' @param seed Optional integer: Sampling seed.
+#' @param num_ctx Optional integer \[1, Inf): Context window size, in tokens.
+#' @param keep_alive Optional character or numeric: How long to keep the model loaded.
+#' @param logprobs Optional logical: Whether to return token log probabilities.
+#' @param top_logprobs Optional integer: How many alternative tokens to return.
+#' @param temperature_max Numeric: Backend's upper bound for `temperature`.
+#' @param top_logprobs_max Numeric: Backend's upper bound for `top_logprobs`.
+#'
+#' @return NULL, invisibly.
+#'
+#' @author EDG
+#' @keywords internal
+#' @noRd
+.check_call_options <- function(
+  temperature = NULL,
+  top_p = NULL,
+  max_tokens = NULL,
+  stop = NULL,
+  top_k = NULL,
+  seed = NULL,
+  num_ctx = NULL,
+  keep_alive = NULL,
+  logprobs = NULL,
+  top_logprobs = NULL,
+  temperature_max = 2,
+  top_logprobs_max = Inf
+) {
+  check_optional_bounded_double_scalar(
+    temperature,
+    lower = 0,
+    upper = temperature_max,
+    arg_name = "temperature"
+  )
+  check_optional_prob_scalar(top_p, arg_name = "top_p")
+  check_optional_pos_integer_scalar(max_tokens, arg_name = "max_tokens")
+  check_optional_pos_integer_scalar(top_k, arg_name = "top_k")
+  check_optional_pos_integer_scalar(num_ctx, arg_name = "num_ctx")
+  check_optional_bounded_integer_scalar(
+    top_logprobs,
+    lower = 0,
+    upper = top_logprobs_max,
+    arg_name = "top_logprobs"
+  )
+  check_optional_integer_scalar(seed, arg_name = "seed")
+  check_character(stop, arg_name = "stop")
+  if (!is.null(stop) && length(stop) == 0L) {
+    abort("`stop` must name at least one sequence.")
+  }
+  .check_keep_alive(keep_alive)
+  check_optional_logical_scalar(logprobs, arg_name = "logprobs")
+  .check_logprobs_args(logprobs, top_logprobs)
+  invisible(NULL)
+}
+# /.check_call_options
+
 # %% build_chat_request_body.OllamaConfig ----
 #' Build Ollama Chat Request Body
 #'
@@ -121,13 +264,20 @@ method(build_response_format, OpenAIConfig) <- function(
 #' @param output_schema Optional Schema: Output schema.
 #' @param think Optional logical: Whether to enable thinking.
 #' @param use_tools Logical: Whether tools are enabled.
-#' @param temperature Optional numeric: Per-call temperature override.
+#' @param temperature Optional numeric \[0, 2\]: Per-call temperature override.
 #' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
 #' @param max_tokens Optional integer \[1, Inf): Maximum tokens to generate
 #' (mapped to Ollama's `options.num_predict`).
 #' @param stop Optional character: Stop sequence(s).
 #' @param top_k Optional integer \[1, Inf): Top-K sampling cutoff.
 #' @param seed Optional integer: Sampling seed for deterministic output.
+#' @param num_ctx Optional integer \[1, Inf): Context window size, in tokens
+#' (mapped to Ollama's `options.num_ctx`).
+#' @param keep_alive Optional character or numeric: How long to keep the model loaded after the
+#' request - a duration string such as `"10m"`, or seconds as a number.
+#' @param logprobs Optional logical: Whether to return log probabilities for the generated tokens.
+#' @param top_logprobs Optional integer \[0, Inf): How many alternative tokens to return log
+#' probabilities for at each position. Requires `logprobs = TRUE`.
 #'
 #' @return Named list.
 #'
@@ -146,8 +296,24 @@ method(build_chat_request_body, OllamaConfig) <- function(
   max_tokens = NULL,
   stop = NULL,
   top_k = NULL,
-  seed = NULL
+  seed = NULL,
+  num_ctx = NULL,
+  keep_alive = NULL,
+  logprobs = NULL,
+  top_logprobs = NULL
 ) {
+  .check_call_options(
+    temperature = temperature,
+    top_p = top_p,
+    max_tokens = max_tokens,
+    stop = stop,
+    top_k = top_k,
+    seed = seed,
+    num_ctx = num_ctx,
+    keep_alive = keep_alive,
+    logprobs = logprobs,
+    top_logprobs = top_logprobs
+  )
   effective_think <- think %||% x@think
   .check_ollama_think(effective_think, "think")
   options <- list(
@@ -168,12 +334,27 @@ method(build_chat_request_body, OllamaConfig) <- function(
   if (!is.null(stop)) {
     options[["stop"]] <- as.character(stop)
   }
+  if (!is.null(num_ctx)) {
+    options[["num_ctx"]] <- as.integer(num_ctx)
+  }
   request_body <- list(
     model = x@model_name,
     messages = build_chat_messages(x, state),
     stream = FALSE,
     options = options
   )
+  # `keep_alive` is a top-level request field, not a sampling option.
+  if (!is.null(keep_alive)) {
+    request_body[["keep_alive"]] <- keep_alive
+  }
+  # So are `logprobs` and `top_logprobs`. Nested under `options` the Ollama
+  # server ignores them silently -- no error, and no `logprobs` in the response.
+  if (!is.null(logprobs)) {
+    request_body[["logprobs"]] <- logprobs
+  }
+  if (!is.null(top_logprobs)) {
+    request_body[["top_logprobs"]] <- as.integer(top_logprobs)
+  }
   if (!is.null(effective_think)) {
     request_body[["think"]] <- effective_think
   }
@@ -196,11 +377,14 @@ method(build_chat_request_body, OllamaConfig) <- function(
 #' @param output_schema Optional Schema: Output schema.
 #' @param think Optional logical: Whether to enable thinking.
 #' @param use_tools Logical: Whether tools are enabled.
-#' @param temperature Optional numeric: Per-call temperature override.
+#' @param temperature Optional numeric \[0, 2\]: Per-call temperature override.
 #' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
 #' @param max_tokens Optional integer \[1, Inf): Maximum tokens to generate.
 #' @param stop Optional character: Stop sequence(s).
 #' @param seed Optional integer: Sampling seed for deterministic output.
+#' @param logprobs Optional logical: Whether to return log probabilities for the generated tokens.
+#' @param top_logprobs Optional integer \[0, 20\]: How many alternative tokens to return log
+#' probabilities for at each position. Requires `logprobs = TRUE`.
 #'
 #' @return Named list.
 #'
@@ -218,8 +402,20 @@ method(build_chat_request_body, OpenAIConfig) <- function(
   top_p = NULL,
   max_tokens = NULL,
   stop = NULL,
-  seed = NULL
+  seed = NULL,
+  logprobs = NULL,
+  top_logprobs = NULL
 ) {
+  .check_call_options(
+    temperature = temperature,
+    top_p = top_p,
+    max_tokens = max_tokens,
+    stop = stop,
+    seed = seed,
+    logprobs = logprobs,
+    top_logprobs = top_logprobs,
+    top_logprobs_max = 20
+  )
   request_body <- list(
     model = x@model_name,
     messages = build_chat_messages(x, state),
@@ -238,6 +434,12 @@ method(build_chat_request_body, OpenAIConfig) <- function(
   if (!is.null(seed)) {
     request_body[["seed"]] <- as.integer(seed)
   }
+  if (!is.null(logprobs)) {
+    request_body[["logprobs"]] <- logprobs
+  }
+  if (!is.null(top_logprobs)) {
+    request_body[["top_logprobs"]] <- as.integer(top_logprobs)
+  }
   if (!is.null(tools) && use_tools) {
     request_body[["tools"]] <- lapply(tools, as_list)
   }
@@ -252,6 +454,17 @@ method(build_chat_request_body, OpenAIConfig) <- function(
   )
   if (!is.null(x@extra_body)) {
     request_body[names(x@extra_body)] <- x@extra_body
+  }
+  if (isTRUE(x@zero_data_retention)) {
+    provider <- request_body[["provider"]] %||% list()
+    if (!is.list(provider)) {
+      abort(
+        "`extra_body[[\"provider\"]]` must be a list when ",
+        "`zero_data_retention = TRUE`."
+      )
+    }
+    provider[["zdr"]] <- TRUE
+    request_body[["provider"]] <- provider
   }
   request_body
 }
@@ -326,9 +539,12 @@ method(perform_chat_request, OpenAIConfig) <- function(
 method(parse_chat_response, OllamaConfig) <- function(x, resp) {
   res <- httr2::resp_body_json(resp, simplifyVector = FALSE)
   message <- res[["message"]]
+  # An empty thinking string means "no reasoning trace", and `reasoning` is
+  # optional, so it is carried as NULL -- as the OpenAI path already does.
+  reasoning <- message[["thinking"]]
   list(
     content = message[["content"]] %||% "",
-    reasoning = message[["thinking"]],
+    reasoning = if (!is.null(reasoning) && nzchar(reasoning)) reasoning,
     tool_calls = message[["tool_calls"]],
     refusal = NULL,
     metadata = res[setdiff(names(res), "message")]
@@ -350,10 +566,10 @@ method(parse_chat_response, OllamaConfig) <- function(x, resp) {
 method(parse_chat_response, OpenAIConfig) <- function(x, resp) {
   res <- httr2::resp_body_json(resp, simplifyVector = FALSE)
   if (is.null(res[["choices"]][[1]])) {
-    cli::cli_abort(c(
-      "OpenAI-compatible response did not include any choices.",
-      i = "Check that the server implements the Chat Completions response shape."
-    ))
+    abort(
+      "OpenAI-compatible response did not include any choices.\n",
+      "Check that the server implements the Chat Completions response shape."
+    )
   }
   choice <- res[["choices"]][[1]]
   message <- choice[["message"]]
@@ -362,6 +578,16 @@ method(parse_chat_response, OpenAIConfig) <- function(x, resp) {
   metadata <- res[setdiff(names(res), "choices")]
   metadata[["finish_reason"]] <- choice[["finish_reason"]]
   metadata[["request_id"]] <- httr2::resp_header(resp, "x-request-id")
+  # Ollama returns its token log probabilities as a flat top-level list, which
+  # the Ollama parser sweeps into metadata for free; OpenAI nests the same
+  # per-token shape under `choices[[1]]$logprobs$content`. Unwrap it here so
+  # `metadata[["logprobs"]]` means the same thing on both backends and
+  # `logprobs()` needs no per-provider branch. (The sibling `$refusal` trace is
+  # not carried: it describes a refusal message, not the response content.)
+  token_logprobs <- choice[["logprobs"]][["content"]]
+  if (!is.null(token_logprobs)) {
+    metadata[["logprobs"]] <- token_logprobs
+  }
   list(
     content = content,
     reasoning = reasoning,
@@ -386,7 +612,7 @@ method(parse_chat_response, OpenAIConfig) <- function(x, resp) {
 method(decode_tool_arguments, OllamaConfig) <- function(x, tool_call) {
   args <- tool_call[["function"]][["arguments"]] %||% list()
   if (!is.list(args)) {
-    cli::cli_abort("Ollama tool arguments must be a list.")
+    abort("Ollama tool arguments must be a list.")
   }
   args
 }
@@ -409,18 +635,21 @@ method(decode_tool_arguments, OpenAIConfig) <- function(x, tool_call) {
     args <- tryCatch(
       jsonlite::fromJSON(args, simplifyVector = FALSE),
       error = function(e) {
-        cli::cli_abort(c(
-          "Could not decode arguments for tool {.val {tool_call[[\"function\"]][[\"name\"]]}}.",
-          i = "Check that the model returned valid JSON function arguments."
-        ))
+        abort(
+          "Could not decode arguments for tool '",
+          tool_call[["function"]][["name"]],
+          "'.\n",
+          "Check that the model returned valid JSON function arguments.",
+          parent = e
+        )
       }
     )
   }
   if (!is.list(args)) {
-    cli::cli_abort(c(
-      "Decoded tool arguments must be a named list.",
-      i = "Check that the model returned a JSON object for function arguments."
-    ))
+    abort(
+      "Decoded tool arguments must be a named list.\n",
+      "Check that the model returned a JSON object for function arguments."
+    )
   }
   args
 }
@@ -473,10 +702,10 @@ method(build_tool_message, OpenAIConfig) <- function(
 ) {
   tool_call_id <- tool_call[["id"]]
   if (is.null(tool_call_id)) {
-    cli::cli_abort(c(
-      "OpenAI-compatible tool calls must include an {.field id}.",
-      i = "Check that the server implements the Chat Completions tool-call response shape."
-    ))
+    abort(
+      "OpenAI-compatible tool calls must include an `id`.\n",
+      "Check that the server implements the Chat Completions tool-call response shape."
+    )
   }
   ToolMessage(
     name = tool_name,
@@ -523,10 +752,10 @@ method(build_chat_messages, AnthropicConfig) <- function(x, state) {
     }
     if (S7_inherits(msg, ToolMessage)) {
       if (is.null(msg@tool_call_id)) {
-        cli::cli_abort(c(
-          "Anthropic tool messages require {.field tool_call_id}.",
-          i = "Use provider adapter tool handling to append tool responses."
-        ))
+        abort(
+          "Anthropic tool messages require `tool_call_id`.\n",
+          "Use provider adapter tool handling to append tool responses."
+        )
       }
       pending_tool_results[[length(pending_tool_results) + 1L]] <- list(
         type = "tool_result",
@@ -545,10 +774,10 @@ method(build_chat_messages, AnthropicConfig) <- function(x, state) {
     }
     if (S7_inherits(msg, InputMessage)) {
       if (!is.null(msg@image_path)) {
-        cli::cli_abort(c(
-          "Anthropic image inputs are not implemented yet.",
-          i = "Use a text-only prompt or add a provider-specific image adapter first."
-        ))
+        abort(
+          "Anthropic image inputs are not implemented yet.\n",
+          "Use a text-only prompt or add a provider-specific image adapter first."
+        )
       }
       out[[length(out) + 1L]] <- list(
         role = "user",
@@ -613,7 +842,7 @@ method(build_response_format, AnthropicConfig) <- function(
 #' @param output_schema Optional Schema: Output schema.
 #' @param think Optional logical: Whether to enable extended thinking.
 #' @param use_tools Logical: Whether tools are enabled.
-#' @param temperature Optional numeric: Per-call temperature override.
+#' @param temperature Optional numeric \[0, 1\]: Per-call temperature override.
 #' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
 #' @param max_tokens Optional integer \[1, Inf): Per-call max_tokens override.
 #' @param stop Optional character: Stop sequence(s) (mapped to `stop_sequences`).
@@ -637,6 +866,15 @@ method(build_chat_request_body, AnthropicConfig) <- function(
   stop = NULL,
   top_k = NULL
 ) {
+  # Anthropic caps `temperature` at 1, not 2.
+  .check_call_options(
+    temperature = temperature,
+    top_p = top_p,
+    max_tokens = max_tokens,
+    stop = stop,
+    top_k = top_k,
+    temperature_max = 1
+  )
   request_body <- list(
     model = x@model_name,
     messages = build_chat_messages(x, state),
@@ -767,10 +1005,13 @@ method(decode_tool_arguments, AnthropicConfig) <- function(x, tool_call) {
     args <- tryCatch(
       jsonlite::fromJSON(args, simplifyVector = FALSE),
       error = function(e) {
-        cli::cli_abort(c(
-          "Could not decode arguments for tool {.val {tool_call[[\"function\"]][[\"name\"]]}}.",
-          i = "Check that the model returned valid JSON tool arguments."
-        ))
+        abort(
+          "Could not decode arguments for tool '",
+          tool_call[["function"]][["name"]],
+          "'.\n",
+          "Check that the model returned valid JSON tool arguments.",
+          parent = e
+        )
       }
     )
   }
@@ -778,10 +1019,10 @@ method(decode_tool_arguments, AnthropicConfig) <- function(x, tool_call) {
     args <- list()
   }
   if (!is.list(args)) {
-    cli::cli_abort(c(
-      "Decoded Anthropic tool arguments must be a named list.",
-      i = "Check that the model returned a JSON object for tool input."
-    ))
+    abort(
+      "Decoded Anthropic tool arguments must be a named list.\n",
+      "Check that the model returned a JSON object for tool input."
+    )
   }
   args
 }
@@ -808,10 +1049,10 @@ method(build_tool_message, AnthropicConfig) <- function(
 ) {
   tool_call_id <- tool_call[["id"]]
   if (is.null(tool_call_id)) {
-    cli::cli_abort(c(
-      "Anthropic tool calls must include an {.field id}.",
-      i = "Check that the server returned a {.val tool_use} content block with an id."
-    ))
+    abort(
+      "Anthropic tool calls must include an `id`.\n",
+      "Check that the server returned a 'tool_use' content block with an id."
+    )
   }
   ToolMessage(
     name = tool_name,

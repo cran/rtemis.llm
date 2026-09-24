@@ -1,3 +1,10 @@
+# %% Tool constants ----
+# JSON Schema types a tool parameter can declare. A tool parameter keeps
+# "object", which a Field does not have: tool schemas are not sent in strict
+# mode, and both backends accept a property-less object parameter there.
+.TOOL_PARAMETER_TYPES <- c(.SCHEMA_FIELD_TYPES, "object")
+
+
 # %% ToolParameter ----
 #' @title ToolParameter
 #'
@@ -14,10 +21,16 @@
 ToolParameter <- new_class(
   "ToolParameter",
   properties = list(
-    name = character_scalar,
-    type = enum(.SCHEMA_FIELD_TYPES),
-    description = character_scalar,
-    required = logical_scalar
+    name = prop_string(description = "Parameter name"),
+    type = prop_string(
+      enum = .TOOL_PARAMETER_TYPES,
+      description = "JSON Schema type"
+    ),
+    description = prop_string(description = "Parameter description"),
+    required = prop_boolean(
+      default = NULL,
+      description = "Whether the tool requires the parameter"
+    )
   )
 )
 
@@ -91,18 +104,16 @@ tool_param <- function(
 Tool <- new_class(
   "Tool",
   properties = list(
-    name = character_scalar,
-    function_name = character_scalar,
-    description = character_scalar,
+    name = prop_string(description = "Tool name"),
+    function_name = prop_string(description = "Name of the function to call"),
+    description = prop_string(description = "Tool description"),
     parameters = class_list,
     impl = optional(class_function)
   ),
   validator = function(self) {
     for (param in self@parameters) {
       if (!S7_inherits(param, ToolParameter)) {
-        cli::cli_abort(
-          "All elements of 'parameters' must be ToolParameter objects."
-        )
+        abort("All elements of 'parameters' must be ToolParameter objects.")
       }
     }
     param_names <- vapply(
@@ -112,9 +123,7 @@ Tool <- new_class(
       USE.NAMES = FALSE
     )
     if (anyDuplicated(param_names)) {
-      cli::cli_abort(
-        "Tool parameter names must be unique. Rename duplicate parameters."
-      )
+      abort("Tool parameter names must be unique. Rename duplicate parameters.")
     }
     NULL
   }
@@ -233,9 +242,7 @@ create_custom_tool <- function(
   impl
 ) {
   if (missing(impl) || !is.function(impl)) {
-    cli::cli_abort(
-      "{.arg impl} must be a function. Use {.fn create_tool} for built-in tools."
-    )
+    abort("`impl` must be a function. Use create_tool() for built-in tools.")
   }
   Tool(
     name = name,
