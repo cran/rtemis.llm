@@ -445,12 +445,14 @@ token_probs <- function(x, tokens, position = 1L) {
 
 
 # %% .keep_errors ----
-# Internal: carry the `errors` attribute across `responses()`, which returns a
-# fresh character vector and so drops the attributes of its input.
+# Internal: carry the `errors` and `elapsed` attributes across `responses()`,
+# which returns a fresh character vector and so drops the attributes of its
+# input.
 .keep_errors <- function(out, from) {
-  errors <- attr(from, "errors")
-  if (!is.null(errors)) {
-    attr(out, "errors") <- errors
+  for (a in c("errors", "elapsed", "batch_elapsed")) {
+    if (!is.null(attr(from, a))) {
+      attr(out, a) <- attr(from, a)
+    }
   }
   validation <- validation_results(from)
   if (!is.null(validation)) {
@@ -470,80 +472,118 @@ token_probs <- function(x, tokens, position = 1L) {
   on_error = c("na", "abort"),
   validate_output = TRUE,
   on_validation_failure = c("warn", "collect", "abort"),
+  image_path = NULL,
+  questions = NULL,
+  concurrency = 1L,
   ...
 ) {
+  check_pos_integer_scalar(concurrency, "concurrency")
+  batch_start <- proc.time()[["elapsed"]]
   on_error <- match.arg(on_error)
   on_validation_failure <- match.arg(on_validation_failure)
   extra <- list(...)
-  schema <- extra[["output_schema"]]
-  if (is.null(schema) && "output_schema" %in% prop_names(f)) {
+  schema <- if (is.null(questions)) extra[["output_schema"]]
+  if (
+    is.null(questions) && is.null(schema) && "output_schema" %in% prop_names(f)
+  ) {
     schema <- f@output_schema
   }
-  # Configuration/compilation errors must fail once, before any batch requests.
   .prepare_output_validation(schema, validate_output, on_validation_failure)
-  label <- repr_bracket(get_model_name(f))
-  error_index <- integer()
-  error_message <- character()
+  if (!is.null(questions)) {
+    .check_decision_questions(questions)
+  }
+  if (length(x) == 1L && length(image_path) > 1L) {
+    x_names <- names(image_path)
+    x <- rep(x, length(image_path))
+    names(x) <- x_names
+  }
+  image_path <- .batch_image_path(image_path, length(x))
+  if (is.null(questions)) {
+    extra[["validate_output"]] <- validate_output
+    extra[["on_validation_failure"]] <- if (on_validation_failure == "warn") {
+      "collect"
+    } else {
+      on_validation_failure
+    }
+  }
+  errors <- vector("list", length(x))
   validation_failures <- vector("list", length(x))
-  out <- progress_lapply(
-    seq_along(x),
-    function(i) {
-      run <- function() {
-        generate(
-          f,
-          x[[i]],
-          verbosity = verbosity - 1L,
-          validate_output = validate_output,
-          on_validation_failure = if (on_validation_failure == "warn") {
-            "collect"
-          } else {
-            on_validation_failure
-          },
-          ...
+  elapsed <- rep(NA_real_, length(x))
+  collect <- function(result, i) {
+    elapsed[[i]] <<- result[["elapsed"]]
+    e <- result[["error"]]
+    if (is.null(e)) {
+      return(result[["value"]])
+    }
+    if (on_error == "abort" || inherits(e, "llm_validation_engine_error")) {
+      stop(e)
+    }
+    errors[[i]] <<- conditionMessage(e)
+    if (inherits(e, "llm_output_validation_error")) {
+      validation_failures[[i]] <<- e[["validation"]]
+      warn(
+        "Element ",
+        i,
+        " failed schema validation. See validation_results().",
+        use_warning = FALSE,
+        verbosity = verbosity
+      )
+    } else {
+      warn(
+        "Element ",
+        i,
+        " failed: ",
+        conditionMessage(e),
+        "\nIts slot is NA_character_ in the result, or NULL with ",
+        "`extract_responses = FALSE`; retry the indices in ",
+        'attr(result, "errors").',
+        use_warning = TRUE
+      )
+    }
+    NULL
+  }
+  out <- if (concurrency > 1L) {
+    .map_concurrent(
+      x,
+      f,
+      image_path,
+      extra,
+      questions,
+      concurrency,
+      collect,
+      verbosity
+    )
+  } else {
+    progress_lapply(
+      seq_along(x),
+      function(i) {
+        collect(
+          .map_call(
+            f,
+            x[[i]],
+            image_path[[i]],
+            verbosity - 1L,
+            extra,
+            questions
+          ),
+          i
         )
-      }
-      if (on_error == "abort") {
-        return(run())
-      }
-      tryCatch(run(), error = function(e) {
-        # An engine failure is an implementation/configuration error, not bad model output.
-        if (inherits(e, "llm_validation_engine_error")) {
-          stop(e)
-        }
-        error_index[[length(error_index) + 1L]] <<- i
-        error_message[[length(error_message) + 1L]] <<- conditionMessage(e)
-        if (inherits(e, "llm_output_validation_error")) {
-          validation_failures[[i]] <<- e[["validation"]]
-          # Explicit validation aborts retain their original text in the batch report.
-          warn(
-            "Element ",
-            i,
-            " failed schema validation. See validation_results().",
-            use_warning = FALSE,
-            verbosity = verbosity
-          )
-        } else {
-          warn(
-            "Element ",
-            i,
-            " failed: ",
-            conditionMessage(e),
-            "\nIts slot is NA_character_ in the result, or NULL with ",
-            "`extract_responses = FALSE`; retry the indices in ",
-            'attr(result, "errors").',
-            use_warning = TRUE
-          )
-        }
-        NULL
-      })
-    },
-    label = label,
-    kind = "llm_map",
-    verbosity = verbosity
-  )
+      },
+      label = repr_bracket(get_model_name(f)),
+      kind = "llm_map",
+      verbosity = verbosity
+    )
+  }
   names(out) <- names(x)
+  names(elapsed) <- names(x)
+  attr(out, "elapsed") <- elapsed
+  attr(out, "batch_elapsed") <- proc.time()[["elapsed"]] - batch_start
   if (on_error == "na") {
-    attr(out, "errors") <- .map_errors(error_index, error_message)
+    index <- which(!vapply(errors, is.null, logical(1L)))
+    attr(out, "errors") <- .map_errors(
+      index,
+      unlist(errors[index], use.names = FALSE) %||% character()
+    )
   }
   if (!is.null(schema)) {
     report <- .combine_output_validation(out, schema, validation_failures)
@@ -562,9 +602,17 @@ method(map, list(class_character, LLM | Agent)) <- function(
   f,
   verbosity = 1L,
   on_error = c("na", "abort"),
+  concurrency = 1L,
   ...
 ) {
-  .map_iter(x, f, verbosity, on_error = match.arg(on_error), ...)
+  .map_iter(
+    x,
+    f,
+    verbosity,
+    on_error = match.arg(on_error),
+    concurrency = concurrency,
+    ...
+  )
 }
 
 
@@ -574,9 +622,74 @@ method(map, list(class_list, LLM | Agent)) <- function(
   f,
   verbosity = 1L,
   on_error = c("na", "abort"),
+  concurrency = 1L,
   ...
 ) {
-  .map_iter(x, f, verbosity, on_error = match.arg(on_error), ...)
+  .map_iter(
+    x,
+    f,
+    verbosity,
+    on_error = match.arg(on_error),
+    concurrency = concurrency,
+    ...
+  )
+}
+
+
+# %% map.(class_character, DecisionModel) ----
+method(map, list(class_character, DecisionModel)) <- function(
+  x,
+  f,
+  verbosity = 1L,
+  on_error = c("na", "abort"),
+  concurrency = 1L,
+  ...
+) {
+  .map_iter(
+    x,
+    f,
+    verbosity,
+    on_error = match.arg(on_error),
+    concurrency = concurrency,
+    ...
+  )
+}
+
+
+# %% map.(class_list, DecisionModel) ----
+method(map, list(class_list, DecisionModel)) <- function(
+  x,
+  f,
+  verbosity = 1L,
+  on_error = c("na", "abort"),
+  concurrency = 1L,
+  ...
+) {
+  .map_iter(
+    x,
+    f,
+    verbosity,
+    on_error = match.arg(on_error),
+    concurrency = concurrency,
+    ...
+  )
+}
+
+
+# %% .refuse_decision_model ----
+# Internal: abort when a decision model reaches an entry point for language
+# models; it answers typed questions and has no turns, tools or text.
+.refuse_decision_model <- function(x, arg) {
+  if (S7_inherits(x, DecisionModel) || S7_inherits(x, DecisionConfig)) {
+    abort(
+      "`",
+      arg,
+      "` is a decision model, which answers typed questions and writes no text.\n",
+      "Use dmapply() to run it over a vector of prompts, generate() to fill ",
+      "a schema, or decide() to ask typed questions."
+    )
+  }
+  invisible(NULL)
 }
 
 
@@ -626,9 +739,20 @@ method(map, list(class_list, LLM | Agent)) <- function(
 #'   Ignored when `model_or_llm` is an `LLM` object.
 #' @param output_schema Optional Schema: Output schema to enforce, created with [schema]. When
 #'   `model_or_llm` is a string, this is baked into the built `LLM`. When `model_or_llm` is a
-#'   pre-built `LLM`, supplying this here is a conflict and will error.
+#'   pre-built `LLM`, supplying this here is a conflict and will error. On the Ollama backend
+#'   the schema constrains the structure, types, and `enum` values of each response and is
+#'   appended to the system prompt, so the model sees field descriptions (see
+#'   `schema_in_prompt` in [create_Ollama]).
 #' @param verbosity Integer \[0, Inf): Verbosity level. The per-call verbosity is `verbosity - 1L`.
 #' @inheritParams generate
+#' @param image_path Optional character or list: Local image files to send with the prompts. A
+#'   character vector sends one image with each element of `x`; a list of character vectors sends
+#'   several (a `NULL` entry sends none). Length 1 is recycled across `x`, and a single prompt in
+#'   `x` is recycled across `image_path`, so one question can be asked of many images. Every file
+#'   is checked before the first request. See [generate].
+#' @param concurrency Positive integer: Maximum number of independent input tasks running at
+#'   once. Defaults to 1 (sequential). Values greater than 1 require the optional 'mirai'
+#'   package. See [map()] for agent isolation, worker requirements, and provider limits.
 #' @param extract_responses Logical: If `TRUE`, return a character vector of assistant responses
 #'   (with `NA_character_` for missing assistant content). If `FALSE`, return the raw list of
 #'   `Message` objects from each call.
@@ -659,6 +783,17 @@ method(map, list(class_list, LLM | Agent)) <- function(
 #'     system_prompt = "Return the hexadecimal code for the color provided in format #FFFFFF",
 #'     temperature = 0.2
 #'   )
+#'   # One question over many images, with a structured answer per image
+#'   llmapply(
+#'     "Describe this figure.",
+#'     "gemma4:e4b",
+#'     output_schema = schema(
+#'       "Figure",
+#'       field("chart type", "Type of chart"),
+#'       field("series", "Number of data series", type = "integer")
+#'     ),
+#'     image_path = c("fig1.png", "fig2.png")
+#'   )
 #' }
 llmapply <- function(
   x,
@@ -671,8 +806,11 @@ llmapply <- function(
   on_error = c("na", "abort"),
   validate_output = TRUE,
   on_validation_failure = c("warn", "collect", "abort"),
+  image_path = NULL,
+  concurrency = 1L,
   ...
 ) {
+  check_pos_integer_scalar(concurrency, "concurrency")
   call <- match.call()
   backend <- match.arg(backend)
   on_error <- match.arg(on_error)
@@ -683,6 +821,7 @@ llmapply <- function(
       "Use agentapply() to run an Agent over a vector of prompts."
     )
   }
+  .refuse_decision_model(model_or_llm, "model_or_llm")
 
   if (S7_inherits(model_or_llm, LLM)) {
     .check_build_conflict(
@@ -723,9 +862,11 @@ llmapply <- function(
     x,
     llm,
     verbosity = verbosity,
+    concurrency = concurrency,
     on_error = on_error,
     validate_output = validate_output,
     on_validation_failure = on_validation_failure,
+    image_path = image_path,
     ...
   )
   if (extract_responses) .keep_errors(responses(out), out) else out
@@ -741,7 +882,9 @@ llmapply <- function(
 #' `output_schema`) or a pre-built `Agent` object.
 #'
 #' Unlike [llmapply], this function can carry tools and memory. The default is `use_memory = FALSE`
-#' because the common case for vectorized calls is independent queries.
+#' because the common case for vectorized calls is independent queries. Within-call tool history
+#' is retained with either memory setting. With `concurrency > 1L`, every input creates a fresh
+#' agent; the supplied agent's accumulated history is neither copied nor modified. See [map()].
 #'
 #' Progress is reported through rtemis.core's nested progress API: one status line labelled with
 #' the model name, ticking once per element, with an ETA. Set `verbosity = 0L` to silence it. When
@@ -760,6 +903,14 @@ llmapply <- function(
 #' @param output_schema Optional Schema: Output schema for the on-the-fly `Agent`.
 #' @param verbosity Integer \[0, Inf): Verbosity level.
 #' @inheritParams generate
+#' @param image_path Optional character or list: Local image files to send with the prompts. A
+#'   character vector sends one image with each element of `x`; a list of character vectors sends
+#'   several (a `NULL` entry sends none). Length 1 is recycled across `x`, and a single prompt in
+#'   `x` is recycled across `image_path`, so one question can be asked of many images. Every file
+#'   is checked before the first request. See [generate].
+#' @param concurrency Positive integer: Maximum number of independent input tasks running at
+#'   once. Defaults to 1 (sequential). Values greater than 1 require the optional 'mirai'
+#'   package. See [map()] for agent isolation, worker requirements, and provider limits.
 #' @param extract_responses Logical: If `TRUE`, return a character vector of assistant responses.
 #'   If `FALSE`, return the raw list of lists of `Message` objects.
 #' @param on_error Character \{"na", "abort"\}: What to do when a single call fails. `"na"` warns,
@@ -804,8 +955,11 @@ agentapply <- function(
   on_error = c("na", "abort"),
   validate_output = TRUE,
   on_validation_failure = c("warn", "collect", "abort"),
+  image_path = NULL,
+  concurrency = 1L,
   ...
 ) {
+  check_pos_integer_scalar(concurrency, "concurrency")
   call <- match.call()
   backend <- match.arg(backend)
   on_error <- match.arg(on_error)
@@ -816,6 +970,7 @@ agentapply <- function(
       "Use llmapply() to run an LLM over a vector of prompts."
     )
   }
+  .refuse_decision_model(model_or_agent, "model_or_agent")
 
   if (S7_inherits(model_or_agent, Agent)) {
     .check_build_conflict(
@@ -860,10 +1015,163 @@ agentapply <- function(
     x,
     agent,
     verbosity = verbosity,
+    concurrency = concurrency,
     on_error = on_error,
     validate_output = validate_output,
     on_validation_failure = on_validation_failure,
+    image_path = image_path,
     ...
+  )
+  if (extract_responses) .keep_errors(responses(out), out) else out
+}
+
+
+# %% dmapply ----
+#' Apply a Decision Model over a vector of prompts
+#'
+#' `dmapply` is the `lapply`-style entry point for a decision model: it fills a closed schema
+#' from each element of `x`, or, with `questions`, asks the same typed questions about each.
+#' Pass either a model name (in which case a `DecisionModel` is built on the fly using `backend`,
+#' `context` and `output_schema`) or a pre-built `DecisionModel` from [create_DecisionModel()].
+#'
+#' Progress, errors and validation work as in [llmapply()]. The result carries an `elapsed`
+#' attribute: the wall time of each call, in seconds, as [llmapply()] and [agentapply()] record
+#' it, so the speed of a decision model and an LLM can be compared item by item.
+#'
+#' @param x Character or list: Values to iterate over. Each element is the passage for one call.
+#' @param model_or_dm Character or DecisionModel: The name of a decision model, or a pre-built
+#'   `DecisionModel`.
+#' @param backend Character \{"ollama", "openrouter"\}: Provider to use when `model_or_dm` is a
+#'   string. Ignored when `model_or_dm` is a `DecisionModel`.
+#' @param context Optional Character: Text placed before every passage, when building the
+#'   `DecisionModel` from a name.
+#' @param output_schema Optional Schema: The closed schema to fill, when building the
+#'   `DecisionModel` from a name. Supplying it with a pre-built `DecisionModel` is a conflict and
+#'   will error.
+#' @param questions Optional named list of [choice()] and [noul()] questions. When given, each
+#'   element of `x` is answered with [decide()] instead of filling a schema.
+#' @param verbosity Integer \[0, Inf): Verbosity level. The per-call verbosity is
+#'   `verbosity - 1L`.
+#' @param concurrency Positive integer: Maximum number of independent input tasks running at
+#'   once. Defaults to 1 (sequential). Values greater than 1 require the optional 'mirai'
+#'   package. See [map()] for agent isolation, worker requirements, and provider limits.
+#' @param extract_responses Logical: If `TRUE`, return the filled documents as a character vector
+#'   of JSON (or, with `questions`, the [probabilities()] table). If `FALSE`, return the list of
+#'   `DecisionMessage` (or `Decision`) objects.
+#' @param on_error Character \{"na", "abort"\}: What to do when a single call fails, as in
+#'   [llmapply()].
+#' @param validate_output Logical: Validate each filled document against the schema.
+#' @param on_validation_failure Character \{"warn", "collect", "abort"\}: As in [generate()].
+#' @param image_path Optional character or list: Local images judged with the passages, recycled
+#'   as in [llmapply()].
+#'
+#' @return With `extract_responses = TRUE`, a character vector the same length as `x` (or a
+#'   `data.table` with `questions`). Otherwise a list of `DecisionMessage` (or `Decision`)
+#'   objects. The result carries an `elapsed` attribute (seconds per element) and, under
+#'   `on_error = "na"`, an `errors` attribute as in [llmapply()]. With a schema,
+#'   [validation_results()] retrieves per-input statuses.
+#'
+#' @author EDG
+#' @export
+#'
+#' @examples
+#' # Requires a running Ollama server with a decision model
+#' \dontrun{
+#'   tickets <- c(
+#'     "The app crashes whenever I open the billing page.",
+#'     "Can I get a quote for 50 seats?"
+#'   )
+#'   triage <- schema(
+#'     "Triage",
+#'     field("team", "Team to route to", enum = c("billing", "engineering", "sales")),
+#'     field("urgent", "Whether it needs an answer today", type = "boolean")
+#'   )
+#'   res <- dmapply(tickets, "clef-flash:9b", output_schema = triage)
+#'   attr(res, "elapsed")
+#' }
+dmapply <- function(
+  x,
+  model_or_dm,
+  backend = c("ollama", "openrouter"),
+  context = NULL,
+  output_schema = NULL,
+  questions = NULL,
+  verbosity = 1L,
+  extract_responses = TRUE,
+  on_error = c("na", "abort"),
+  validate_output = TRUE,
+  on_validation_failure = c("warn", "collect", "abort"),
+  image_path = NULL,
+  concurrency = 1L
+) {
+  check_pos_integer_scalar(concurrency, "concurrency")
+  call <- match.call()
+  backend <- match.arg(backend)
+  on_error <- match.arg(on_error)
+  on_validation_failure <- match.arg(on_validation_failure)
+
+  if (S7_inherits(model_or_dm, LLM) || S7_inherits(model_or_dm, Agent)) {
+    abort(
+      "`model_or_dm` is a language model, not a decision model.\n",
+      "Use llmapply() for an LLM or agentapply() for an Agent."
+    )
+  }
+  if (S7_inherits(model_or_dm, DecisionModel)) {
+    .check_build_conflict(
+      call,
+      build_args = c("backend", "context", "output_schema"),
+      object_name = "model_or_dm"
+    )
+    dm <- model_or_dm
+  } else if (is.character(model_or_dm) && length(model_or_dm) == 1L) {
+    config <- switch(
+      backend,
+      ollama = config_OllamaDecision(model_name = model_or_dm),
+      openrouter = config_OpenRouterDecision(model_name = model_or_dm)
+    )
+    dm <- create_DecisionModel(
+      config,
+      context = context,
+      output_schema = output_schema
+    )
+  } else {
+    abort(
+      "`model_or_dm` must be a single model-name string or a DecisionModel.\n",
+      "Got <",
+      paste(class(model_or_dm), collapse = "/"),
+      ">."
+    )
+  }
+
+  if (!is.null(questions)) {
+    out <- .map_iter(
+      x,
+      dm,
+      verbosity,
+      on_error = on_error,
+      image_path = image_path,
+      questions = questions,
+      concurrency = concurrency
+    )
+    return(
+      if (extract_responses) .keep_errors(probabilities(out), out) else out
+    )
+  }
+  if (is.null(dm@output_schema)) {
+    abort(
+      "dmapply() needs an output schema to fill, or `questions` to ask.\n",
+      "Pass `output_schema`, set it in create_DecisionModel(), or pass `questions`."
+    )
+  }
+  out <- map(
+    x,
+    dm,
+    verbosity = verbosity,
+    concurrency = concurrency,
+    on_error = on_error,
+    validate_output = validate_output,
+    on_validation_failure = on_validation_failure,
+    image_path = image_path
   )
   if (extract_responses) .keep_errors(responses(out), out) else out
 }

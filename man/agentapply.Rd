@@ -18,6 +18,8 @@ agentapply(
   on_error = c("na", "abort"),
   validate_output = TRUE,
   on_validation_failure = c("warn", "collect", "abort"),
+  image_path = NULL,
+  concurrency = 1L,
   ...
 )
 }
@@ -57,6 +59,16 @@ Disabling this does not disable the schema sent to the model.}
 and report a styled rtemis.core message (not an R warning), collect silently, or
 abort with an error carrying \code{output} and \code{validation}. See \link{validate_output}.}
 
+\item{image_path}{Optional character or list: Local image files to send with the prompts. A
+character vector sends one image with each element of \code{x}; a list of character vectors sends
+several (a \code{NULL} entry sends none). Length 1 is recycled across \code{x}, and a single prompt in
+\code{x} is recycled across \code{image_path}, so one question can be asked of many images. Every file
+is checked before the first request. See \link{generate}.}
+
+\item{concurrency}{Positive integer: Maximum number of independent input tasks running at
+once. Defaults to 1 (sequential). Values greater than 1 require the optional 'mirai'
+package. See \code{\link[=map]{map()}} for agent isolation, worker requirements, and provider limits.}
+
 \item{...}{Additional per-call arguments forwarded to \link{generate}.}
 }
 \value{
@@ -76,7 +88,9 @@ on the fly using \code{backend}, \code{system_prompt}, \code{tools}, \code{use_m
 }
 \details{
 Unlike \link{llmapply}, this function can carry tools and memory. The default is \code{use_memory = FALSE}
-because the common case for vectorized calls is independent queries.
+because the common case for vectorized calls is independent queries. Within-call tool history
+is retained with either memory setting. With \code{concurrency > 1L}, every input creates a fresh
+agent; the supplied agent's accumulated history is neither copied nor modified. See \code{\link[=map]{map()}}.
 
 Progress is reported through rtemis.core's nested progress API: one status line labelled with
 the model name, ticking once per element, with an ETA. Set \code{verbosity = 0L} to silence it. When

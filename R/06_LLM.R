@@ -299,7 +299,13 @@ method(repr, Anthropic) <- function(x, output_type = NULL) {
     highlight(x@system_prompt, output_type = output_type),
     "\n",
     fmt("  Temperature: ", bold = TRUE, output_type = output_type),
-    highlight(x@config@temperature, output_type = output_type),
+    highlight(
+      x@config@temperature %||% "model default",
+      output_type = output_type
+    ),
+    "\n",
+    fmt("       Effort: ", bold = TRUE, output_type = output_type),
+    highlight(x@config@effort %||% "model default", output_type = output_type),
     "\n",
     if (!is.null(x@output_schema)) {
       paste0(
@@ -327,6 +333,7 @@ method(print, Anthropic) <- function(x, output_type = NULL, ...) {
 #' @param max_tokens Optional integer \[1, Inf): Maximum tokens to generate
 #' (mapped to `options.num_predict`).
 #' @param stop Optional character: Stop sequence(s).
+#' @param image_path Optional character: Paths to local image files to send with the prompt.
 #' @param think Optional logical or character: Whether to enable thinking.
 #' @param output_schema Optional Schema: Per-call output schema override.
 #' @inheritParams generate
@@ -346,6 +353,7 @@ method(generate, Ollama) <- function(
   top_p = NULL,
   max_tokens = NULL,
   stop = NULL,
+  image_path = NULL,
   think = NULL,
   output_schema = NULL,
   verbosity = 1L,
@@ -384,7 +392,7 @@ method(generate, Ollama) <- function(
   )
   append_message(
     state,
-    InputMessage(content = prompt),
+    InputMessage(content = prompt, image_path = image_path),
     echo = FALSE,
     verbosity = 0L
   )
@@ -440,6 +448,7 @@ method(generate, Ollama) <- function(
 #' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
 #' @param max_tokens Optional integer \[1, Inf): Maximum tokens to generate.
 #' @param stop Optional character: Stop sequence(s).
+#' @param image_path Optional character: Paths to local image files to send with the prompt.
 #' @param think Optional logical: Whether to enable thinking options.
 #' @param output_schema Optional Schema: Per-call output schema override.
 #' @inheritParams generate
@@ -458,6 +467,7 @@ method(generate, OpenAI) <- function(
   top_p = NULL,
   max_tokens = NULL,
   stop = NULL,
+  image_path = NULL,
   think = NULL,
   output_schema = NULL,
   verbosity = 1L,
@@ -489,7 +499,7 @@ method(generate, OpenAI) <- function(
   )
   append_message(
     state,
-    InputMessage(content = prompt),
+    InputMessage(content = prompt, image_path = image_path),
     echo = FALSE,
     verbosity = 0L
   )
@@ -539,15 +549,16 @@ method(generate, OpenAI) <- function(
 #'
 #' @param x Anthropic object.
 #' @param prompt Character: The prompt to send to the model.
-#' @param temperature Optional numeric \[0, 2\]: Per-call temperature override.
+#' @param temperature Optional numeric \[0, 1\]: Per-call temperature override.
 #' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
 #' @param max_tokens Optional integer \[1, Inf): Per-call max_tokens override.
 #' @param stop Optional character: Stop sequence(s) (mapped to `stop_sequences`).
-#' @param think Optional logical: Whether to enable extended thinking for this call.
+#' @param image_path Optional character: Paths to local image files to send with the prompt.
+#' @param think Optional logical: Per-call override of the config's `think`.
 #' @param output_schema Optional Schema: Per-call output schema override.
 #' @inheritParams generate
 #' @param verbosity Integer: Verbosity level.
-#' @param ... Additional per-call options: `top_k` (integer).
+#' @param ... Additional per-call options: `top_k` (integer), `effort` (character).
 #'
 #' @return AnthropicMessage object
 #' @author EDG
@@ -560,6 +571,7 @@ method(generate, Anthropic) <- function(
   top_p = NULL,
   max_tokens = NULL,
   stop = NULL,
+  image_path = NULL,
   think = NULL,
   output_schema = NULL,
   verbosity = 1L,
@@ -577,6 +589,7 @@ method(generate, Anthropic) <- function(
   check_inherits(prompt, "character")
   extra <- list(...)
   top_k <- extra[["top_k"]]
+  effort <- extra[["effort"]]
   state <- InProcessAgentMemory()
   append_message(
     state,
@@ -589,7 +602,7 @@ method(generate, Anthropic) <- function(
   )
   append_message(
     state,
-    InputMessage(content = prompt),
+    InputMessage(content = prompt, image_path = image_path),
     echo = FALSE,
     verbosity = 0L
   )
@@ -603,7 +616,8 @@ method(generate, Anthropic) <- function(
     top_p = top_p,
     max_tokens = max_tokens,
     stop = stop,
-    top_k = top_k
+    top_k = top_k,
+    effort = effort
   )
   msg(repr_bracket(x@config@model_name), "working...", verbosity = verbosity)
   resp <- perform_chat_request(
@@ -644,6 +658,12 @@ method(generate, Anthropic) <- function(
 #' for this config. Logical values target models like deepseek or qwen3; character values target
 #' gpt-oss. When `NULL`, the field is omitted from requests and Ollama uses the model default. Can
 #' be overridden per call.
+#' @param schema_in_prompt Logical: Whether to append the output schema to the system prompt of
+#' each request that has one. Ollama uses the schema, sent as `format`, only to constrain
+#' decoding, so the model sees field descriptions only through the prompt. The system prompt is
+#' followed by a blank line, `Respond with JSON that conforms to this JSON Schema:`, and the
+#' schema as JSON. Set to `FALSE` when the system prompt already states the schema and the field
+#' instructions.
 #'
 #' @return OllamaConfig object
 #'
@@ -662,13 +682,15 @@ config_Ollama <- function(
   model_name,
   temperature = TEMPERATURE_DEFAULT,
   base_url = OLLAMA_URL_DEFAULT,
-  think = NULL
+  think = NULL,
+  schema_in_prompt = TRUE
 ) {
   OllamaConfig(
     model_name = model_name,
     temperature = temperature,
     base_url = base_url,
-    think = think
+    think = think,
+    schema_in_prompt = schema_in_prompt
   )
 } # /config_Ollama
 
@@ -680,11 +702,15 @@ config_Ollama <- function(
 #' @param system_prompt Character: The system prompt to use.
 #' @param temperature Numeric: The temperature for the model.
 #' @param output_schema Optional Schema: An optional output schema created using [schema].
+#'   Ollama constrains the response to the schema's structure, types, and `enum` values. With
+#'   `schema_in_prompt = TRUE`, the schema, including field descriptions, is also appended to the
+#'   system prompt of each request.
 #' @param name Character or NULL: An optional name for the Ollama object.
 #' @param base_url Character: Base URL of Ollama server.
 #' @param think Optional Logical or Character \{"low", "medium", "high"\}: Default thinking mode.
 #' Logical values target models like deepseek or qwen3; character values target gpt-oss.
 #' When `NULL`, the field is omitted from requests and Ollama uses the model default.
+#' @inheritParams config_Ollama
 #'
 #' @return Ollama LLM object
 #'
@@ -708,7 +734,8 @@ create_Ollama <- function(
   output_schema = NULL,
   name = NULL,
   base_url = OLLAMA_URL_DEFAULT,
-  think = NULL
+  think = NULL,
+  schema_in_prompt = TRUE
 ) {
   ollama_check_model(model_name)
   check_character_scalar(system_prompt, "system_prompt")
@@ -721,7 +748,8 @@ create_Ollama <- function(
       model_name = model_name,
       temperature = temperature,
       base_url = base_url,
-      think = think
+      think = think,
+      schema_in_prompt = schema_in_prompt
     ),
     system_prompt = system_prompt,
     output_schema = output_schema
@@ -841,6 +869,11 @@ config_OpenAI <- function(
 #' @details With `zero_data_retention = TRUE`, each OpenRouter request includes
 #' `provider.zdr = true`. OpenRouter will then consider only endpoints with a ZDR policy. This
 #' option does not activate account-level ZDR at OpenAI, Anthropic, or other providers.
+#'
+#' A response whose message carries a non-empty `refusal`, or an error response with code
+#' `"refusal"`, raises an error of class `rtemis_llm_refusal`, whose `refusal`, `finish_reason`,
+#' and `status_code` fields carry the server's refusal text, the choice's `finish_reason`, and the
+#' HTTP status.
 #'
 #' @author EDG
 #' @export
@@ -977,6 +1010,11 @@ config_Apple <- function(
 #'
 #' @return Apple LLM object
 #'
+#' @details The on-device model declines some requests. The bridge returns each refusal as a
+#' message with a `refusal` field, which raises an error of class `rtemis_llm_refusal`; under
+#' `on_error = "na"`, [llmapply] and [map] leave `NA` in that element's slot and record it in the
+#' `errors` attribute.
+#'
 #' @author EDG
 #' @export
 #'
@@ -1023,9 +1061,27 @@ create_Apple <- function(
 #'
 #' Creates a AnthropicConfig object which can be passed to `create_agent()`
 #'
+#' @details
+#' Every request follows the request rules of the model named in `model_name`: which sampling
+#' parameters it accepts, how thinking is turned on and off, its effort levels, whether
+#' structured output uses `output_config.format` or a forced tool call, whether it accepts a
+#' trailing assistant message, and whether it has server-side fallbacks. A value the model
+#' rejects aborts here or before the request, with a message naming the model and the argument.
+#' The rules come from a table built into the package. Model names absent from the table, such as
+#' those of Anthropic-compatible servers, send every configured field as given and use a forced
+#' tool call for structured output. With `validate_model = TRUE`, the model's capabilities read
+#' from the Models API (`GET /models/{id}`) replace the table's structured-output, thinking and
+#' effort entries.
+#'
+#' A response with `stop_reason` `"refusal"` raises an error of class `rtemis_llm_refusal`, whose
+#' `category` and `explanation` fields carry the response's `stop_details`. A response that stops
+#' at `max_tokens` raises a warning and returns the truncated text.
+#'
 #' @param model_name Character: The name of the Anthropic model to use (for example
-#' `"claude-sonnet-4-6"`).
-#' @param temperature Numeric \[0, 2\]: The temperature for the model.
+#' `"claude-opus-5-5"`).
+#' @param temperature Optional numeric \[0, 1\]: The temperature for the model. `NULL` omits it
+#' from the request, and the model uses its default. Claude Opus 4.7 and later reject it; Claude
+#' Sonnet 5, Claude Sonnet 5.5 and Claude Haiku 5.5 accept only `1`, their default.
 #' @param base_url Character: Base URL of the Anthropic API.
 #' @param api_key Optional character: API key.
 #' @param api_key_env Character: Environment variable containing the API key.
@@ -1033,14 +1089,29 @@ create_Apple <- function(
 #' @param anthropic_version Character: Value of the required `anthropic-version` header.
 #' @param anthropic_beta Optional character: Value(s) for the `anthropic-beta` header. A character
 #' vector is comma-joined.
-#' @param max_tokens Integer \[1, Inf): Maximum number of tokens the model may generate. Required by
-#' the Messages API.
+#' @param max_tokens Integer \[1, Inf): Maximum number of tokens the model may generate, thinking
+#' included. Required by the Messages API.
 #' @param timeout Numeric (0, Inf): Request timeout in seconds.
 #' @param extra_headers Optional list: Additional HTTP headers.
 #' @param extra_body Optional list: Additional request body fields.
-#' @param thinking_budget_tokens Optional integer \[1024, Inf): Budget for extended thinking. When
-#' set, each request enables extended thinking with this budget.
-#' @param validate_model Logical: Whether to validate model availability using `/models`.
+#' @param thinking_budget_tokens Optional integer \[1024, Inf): Budget for extended thinking, sent
+#' as `thinking: {type: "enabled", budget_tokens}` on models that accept a budget (Claude Opus 4.6,
+#' Claude Sonnet 4.6, and Claude 4.5 models and earlier). Must be less than `max_tokens`.
+#' @param think Optional logical: Whether the model thinks. `NULL` runs the model's default. `TRUE`
+#' sends `thinking_budget_tokens` when set, and adaptive thinking otherwise. `FALSE` sends the
+#' model's off form: `{type: "disabled"}`, `{type: "between_tools"}` on Claude Sonnet 5.5, or no
+#' `thinking` field. Claude Opus 5.5 and Claude Fable 5 models always think, and `FALSE` aborts.
+#' Can be overridden per call.
+#' @param effort Optional character \{"low", "medium", "high", "xhigh", "max"\}: How much the model
+#' thinks and writes, sent as `output_config.effort`. `NULL` runs the model's default (`"medium"`
+#' on Claude Opus 5.5 and Claude Haiku 5.5, `"high"` on other models with effort). Can be
+#' overridden per call.
+#' @param fallbacks Optional character: Server-side fallbacks for refused requests: `"default"`
+#' (Anthropic chooses the fallback model by refusal category), or 1 to 3 model names. `NULL` sends
+#' no fallback, so every response comes from `model_name`. Claude Sonnet 5.5 accepts only
+#' `"default"`. The matching `anthropic-beta` header is added.
+#' @param validate_model Logical: Whether to check the model with the Models API and read its
+#' capabilities.
 #'
 #' @return AnthropicConfig object
 #'
@@ -1048,16 +1119,16 @@ create_Apple <- function(
 #' @export
 #'
 #' @examples
-#' cfg <- config <- config_Anthropic(
-#'    model_name = "claude-sonnet-4-6",
-#'    temperature = 0.4,
+#' cfg <- config_Anthropic(
+#'    model_name = "claude-opus-5-5",
+#'    effort = "low",
 #'    api_key = "test-key",
 #'    max_tokens = 1024L,
 #'    validate_model = FALSE
 #' )
 config_Anthropic <- function(
   model_name,
-  temperature = TEMPERATURE_DEFAULT,
+  temperature = NULL,
   base_url = ANTHROPIC_URL_DEFAULT,
   api_key = NULL,
   api_key_env = ANTHROPIC_API_KEY_ENV_DEFAULT,
@@ -1069,6 +1140,9 @@ config_Anthropic <- function(
   extra_headers = NULL,
   extra_body = NULL,
   thinking_budget_tokens = NULL,
+  think = NULL,
+  effort = NULL,
+  fallbacks = NULL,
   validate_model = FALSE
 ) {
   check_character_scalar(model_name)
@@ -1088,6 +1162,9 @@ config_Anthropic <- function(
     extra_headers = extra_headers,
     extra_body = extra_body,
     thinking_budget_tokens = thinking_budget_tokens,
+    think = think,
+    effort = effort,
+    fallbacks = fallbacks,
     validate_model = validate_model
   )
 } # /config_Anthropic
@@ -1096,24 +1173,16 @@ config_Anthropic <- function(
 # %% create_Anthropic ----
 #' Create a Anthropic LLM Object
 #'
-#' @param model_name Character: The name of the Anthropic model to use.
+#' @inheritParams config_Anthropic
 #' @param system_prompt Character: The system prompt to use.
-#' @param temperature Numeric \[0, 2\]: The temperature for the model.
-#' @param output_schema Optional Schema: Output schema created using [schema]. Structured output is
-#' implemented by forcing a single synthetic tool call whose `input_schema` is this schema.
+#' @param output_schema Optional Schema: Output schema created using [schema]. On models with
+#' structured outputs, the schema is sent as `output_config.format` and the answer is the text
+#' block of the response; on other models, structured output is a forced call of a synthetic tool
+#' whose input schema is this schema.
 #' @param name Optional character: Name for the LLM object.
-#' @param base_url Character: Base URL of the Anthropic API.
-#' @param api_key Optional character: API key.
-#' @param api_key_env Character: Environment variable containing the API key.
-#' @param keychain_service Optional character: macOS Keychain service containing the API key.
-#' @param anthropic_version Character: Value of the required `anthropic-version` header.
-#' @param anthropic_beta Optional character: Value(s) for the `anthropic-beta` header.
-#' @param max_tokens Integer \[1, Inf): Maximum number of tokens the model may generate.
-#' @param timeout Numeric (0, Inf): Request timeout in seconds.
-#' @param extra_headers Optional list: Additional HTTP headers.
-#' @param extra_body Optional list: Additional request body fields.
-#' @param thinking_budget_tokens Optional integer \[1024, Inf): Extended-thinking budget.
-#' @param validate_model Logical: Whether to validate model availability using `/models`.
+#'
+#' @details
+#' See [config_Anthropic] for how each request follows the configured model's rules.
 #'
 #' @return Anthropic LLM object
 #'
@@ -1122,7 +1191,7 @@ config_Anthropic <- function(
 #'
 #' @examples
 #' llm <- create_Anthropic(
-#'    model_name = "claude-sonnet-4-6",
+#'    model_name = "claude-opus-5-5",
 #'    system_prompt = "You are a meticulous research assistant.",
 #'    api_key = "test-key",
 #'    validate_model = FALSE
@@ -1130,7 +1199,7 @@ config_Anthropic <- function(
 create_Anthropic <- function(
   model_name,
   system_prompt = SYSTEM_PROMPT_DEFAULT,
-  temperature = TEMPERATURE_DEFAULT,
+  temperature = NULL,
   output_schema = NULL,
   name = NULL,
   base_url = ANTHROPIC_URL_DEFAULT,
@@ -1144,6 +1213,9 @@ create_Anthropic <- function(
   extra_headers = NULL,
   extra_body = NULL,
   thinking_budget_tokens = NULL,
+  think = NULL,
+  effort = NULL,
+  fallbacks = NULL,
   validate_model = FALSE
 ) {
   check_character_scalar(model_name)
@@ -1167,6 +1239,9 @@ create_Anthropic <- function(
       extra_headers = extra_headers,
       extra_body = extra_body,
       thinking_budget_tokens = thinking_budget_tokens,
+      think = think,
+      effort = effort,
+      fallbacks = fallbacks,
       validate_model = validate_model
     ),
     system_prompt = system_prompt,

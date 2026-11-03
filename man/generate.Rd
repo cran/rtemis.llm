@@ -11,6 +11,7 @@ generate(
   top_p = NULL,
   max_tokens = NULL,
   stop = NULL,
+  image_path = NULL,
   think = NULL,
   output_schema = NULL,
   verbosity = 1L,
@@ -20,7 +21,8 @@ generate(
 )
 }
 \arguments{
-\item{x}{An object of class LLM or Agent.}
+\item{x}{An object of class LLM, Agent or DecisionModel. A \code{DecisionModel} fills its output
+schema and takes no sampling options; see \code{\link[=create_DecisionModel]{create_DecisionModel()}}.}
 
 \item{prompt}{Character: The prompt to pass to the model or agent.}
 
@@ -34,6 +36,10 @@ this overrides the config-level value (which is required); for Ollama this maps 
 
 \item{stop}{Optional character: Stop sequence(s). Mapped to \code{stop_sequences} on Anthropic
 and \code{options.stop} on Ollama.}
+
+\item{image_path}{Optional character: Paths to one or more local image files (PNG, JPEG, GIF, or
+WebP) to send with the prompt. Each file is checked and read before the request is sent. The
+model must accept image input; a model that does not is reported as an error by its server.}
 
 \item{think}{Optional logical or character: Whether to enable model thinking
 (reasoning trace) for this call. Character values target \code{gpt-oss}-style local models.}

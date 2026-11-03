@@ -15,6 +15,8 @@ llmapply(
   on_error = c("na", "abort"),
   validate_output = TRUE,
   on_validation_failure = c("warn", "collect", "abort"),
+  image_path = NULL,
+  concurrency = 1L,
   ...
 )
 }
@@ -33,7 +35,10 @@ Ignored when \code{model_or_llm} is an \code{LLM} object.}
 
 \item{output_schema}{Optional Schema: Output schema to enforce, created with \link{schema}. When
 \code{model_or_llm} is a string, this is baked into the built \code{LLM}. When \code{model_or_llm} is a
-pre-built \code{LLM}, supplying this here is a conflict and will error.}
+pre-built \code{LLM}, supplying this here is a conflict and will error. On the Ollama backend
+the schema constrains the structure, types, and \code{enum} values of each response and is
+appended to the system prompt, so the model sees field descriptions (see
+\code{schema_in_prompt} in \link{create_Ollama}).}
 
 \item{verbosity}{Integer [0, Inf): Verbosity level. The per-call verbosity is \code{verbosity - 1L}.}
 
@@ -52,6 +57,16 @@ Disabling this does not disable the schema sent to the model.}
 \item{on_validation_failure}{Character \{"warn", "collect", "abort"\}: Preserve invalid output
 and report a styled rtemis.core message (not an R warning), collect silently, or
 abort with an error carrying \code{output} and \code{validation}. See \link{validate_output}.}
+
+\item{image_path}{Optional character or list: Local image files to send with the prompts. A
+character vector sends one image with each element of \code{x}; a list of character vectors sends
+several (a \code{NULL} entry sends none). Length 1 is recycled across \code{x}, and a single prompt in
+\code{x} is recycled across \code{image_path}, so one question can be asked of many images. Every file
+is checked before the first request. See \link{generate}.}
+
+\item{concurrency}{Positive integer: Maximum number of independent input tasks running at
+once. Defaults to 1 (sequential). Values greater than 1 require the optional 'mirai'
+package. See \code{\link[=map]{map()}} for agent isolation, worker requirements, and provider limits.}
 
 \item{...}{Additional per-call arguments forwarded to \link{generate} (e.g. \code{temperature}, \code{top_p},
 \code{max_tokens}, \code{stop}, \code{think}, \code{top_k}, \code{seed}, and for Ollama \code{num_ctx} and \code{keep_alive}).}
@@ -88,6 +103,17 @@ events instead of being drawn, and nests under any enclosing progress node.
     "gemma4:e4b",
     system_prompt = "Return the hexadecimal code for the color provided in format #FFFFFF",
     temperature = 0.2
+  )
+  # One question over many images, with a structured answer per image
+  llmapply(
+    "Describe this figure.",
+    "gemma4:e4b",
+    output_schema = schema(
+      "Figure",
+      field("chart type", "Type of chart"),
+      field("series", "Number of data series", type = "integer")
+    ),
+    image_path = c("fig1.png", "fig2.png")
   )
 }
 }

@@ -12,7 +12,8 @@
 #' @field llmconfig LLMConfig: The LLMConfig to use.
 #' @field state AgentMemory: The state of the agent contains the message history and metadata.
 #' @field system_prompt Optional character: The system prompt to use.
-#' @field use_memory Logical: Whether to store conversation history in agent state.
+#' @field use_memory Logical: Whether to retain conversation history across calls.
+#'   Within-call state is retained for all tool rounds with either setting.
 #' @field tools Optional list of Tool objects: The tools available to the agent.
 #' @field max_tool_rounds Integer: Maximum number of tool call rounds per query.
 #' @field output_schema Optional Schema: The output schema to enforce on the agent's response.
@@ -399,7 +400,8 @@ method(get_messages, Agent) <- function(x, last = FALSE) {
 #' @param llmconfig `LLMConfig`: The LLM configuration to use. Create using one of [config_Ollama],
 #'   [config_OpenAI], [config_Anthropic], or [config_Apple].
 #' @param system_prompt Optional character: The system prompt to use.
-#' @param use_memory Logical: Whether to use conversation memory.
+#' @param use_memory Logical: Whether to retain conversation history across calls.
+#'   A call retains its own messages and tool results with either setting.
 #' @param tools Optional list of Tool objects: The tools available to the agent.
 #' @param max_tool_rounds Integer: Maximum number of tool call rounds per query.
 #' @param output_schema Optional Schema: The output schema to enforce on the agent's response
@@ -447,6 +449,7 @@ create_agent <- function(
   logfile = NULL,
   verbosity = 1L
 ) {
+  .refuse_decision_model(llmconfig, "llmconfig")
   check_optional_character_scalar(system_prompt, "system_prompt")
   check_logical_scalar(use_memory, "use_memory")
   max_tool_rounds <- clean_int(max_tool_rounds)
@@ -486,7 +489,7 @@ create_agent <- function(
 #' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
 #' @param max_tokens Optional integer \[1, Inf): Per-call maximum tokens to generate.
 #' @param stop Optional character: Stop sequence(s).
-#' @param image_path Optional character: Path to an image to include in the prompt.
+#' @param image_path Optional character: Paths to local image files to send with the prompt.
 #' @param think Optional logical: Whether to enable thinking (reasoning trace) for this call. Only
 #' supported by certain models.
 #' @param output_schema Optional Schema: The output schema to enforce on the agent's response.
@@ -599,7 +602,15 @@ method(generate, Agent) <- function(
     )
   )
 
-  msg(repr_bracket(x@llmconfig@model_name), "working...", verbosity = verbosity)
+  # Inside chat(), a spinner drawn during the request stands in for these two lines.
+  show_status <- !.spinner_enabled(verbosity)
+  if (show_status) {
+    msg(
+      repr_bracket(x@llmconfig@model_name),
+      "working...",
+      verbosity = verbosity
+    )
+  }
 
   # {>>} Perform initial request
   resp <- perform_chat_request(
@@ -607,8 +618,9 @@ method(generate, Agent) <- function(
     request_body = request_body,
     verbosity = verbosity
   )
-  # Replace working message with done
-  msg(repr_bracket(x@llmconfig@model_name), "done.", verbosity = verbosity)
+  if (show_status) {
+    msg(repr_bracket(x@llmconfig@model_name), "done.", verbosity = verbosity)
+  }
 
   # {<<} Initial response
   res <- parse_chat_response(x@llmconfig, resp)
@@ -820,8 +832,13 @@ method(generate, Agent) <- function(
         request_body = followup_request_body,
         verbosity = verbosity
       )
-      # Replace working message with done
-      msg(repr_bracket(x@llmconfig@model_name), "done.", verbosity = verbosity)
+      if (show_status) {
+        msg(
+          repr_bracket(x@llmconfig@model_name),
+          "done.",
+          verbosity = verbosity
+        )
+      }
       # {<<} Follow-up response
       res <- parse_chat_response(x@llmconfig, followup_resp)
 

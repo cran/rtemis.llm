@@ -34,11 +34,18 @@ method(build_chat_messages, OpenAIConfig) <- function(x, state) {
   unname(lapply(
     get_messages(state),
     function(msg) {
-      if (S7_inherits(msg, InputMessage) && !is.null(msg@image_path)) {
-        abort(
-          "OpenAI-compatible image inputs are not implemented yet.\n",
-          "Use a text-only prompt or add a provider-specific image adapter first."
-        )
+      if (S7_inherits(msg, InputMessage) && !is.null(msg@images)) {
+        # Text first, then one `image_url` part per image, as in OpenAI's docs.
+        # An empty prompt sends the images alone.
+        return(list(
+          role = msg@role,
+          content = c(
+            if (nzchar(msg@content)) {
+              list(list(type = "text", text = msg@content))
+            },
+            .openai_image_parts(msg@images)
+          )
+        ))
       }
       if (S7_inherits(msg, ToolMessage)) {
         if (is.null(msg@tool_call_id)) {
@@ -85,6 +92,48 @@ method(build_response_format, OllamaConfig) <- function(
     return(NULL)
   }
   as_list(output_schema)
+}
+
+
+# %% .ollama_schema_in_prompt() ----
+#' Append the Output Schema to the Ollama System Prompt
+#'
+#' Ollama compiles `format` into a decoding constraint and does not show it to the model, so
+#' field descriptions reach the model only through the prompt. Ollama's structured outputs
+#' documentation recommends passing the JSON Schema as a string in the prompt as well. The schema
+#' is serialized with the settings of `httr2::req_body_json()`, so the text is the `format` sent
+#' in the same request. The text is appended to the first system message, or sent as a system
+#' message when the conversation has none. Agent memory is left unchanged.
+#'
+#' @param messages List: Chat messages from `build_chat_messages()`.
+#' @param format List: JSON Schema sent as the request's `format`.
+#'
+#' @return List of message lists.
+#'
+#' @author EDG
+#' @keywords internal
+#' @noRd
+.ollama_schema_in_prompt <- function(messages, format) {
+  instruction <- paste0(
+    "Respond with JSON that conforms to this JSON Schema:\n",
+    jsonlite::toJSON(
+      format,
+      auto_unbox = TRUE,
+      digits = 22,
+      null = "null"
+    )
+  )
+  roles <- vapply(messages, function(m) m[["role"]] %||% "", character(1L))
+  i <- match("system", roles)
+  if (is.na(i)) {
+    return(c(list(list(role = "system", content = instruction)), messages))
+  }
+  messages[[i]][["content"]] <- paste0(
+    messages[[i]][["content"]],
+    "\n\n",
+    instruction
+  )
+  messages
 }
 
 
@@ -337,9 +386,14 @@ method(build_chat_request_body, OllamaConfig) <- function(
   if (!is.null(num_ctx)) {
     options[["num_ctx"]] <- as.integer(num_ctx)
   }
+  messages <- build_chat_messages(x, state)
+  format <- build_response_format(x, output_schema)
+  if (!is.null(format) && x@schema_in_prompt) {
+    messages <- .ollama_schema_in_prompt(messages, format)
+  }
   request_body <- list(
     model = x@model_name,
-    messages = build_chat_messages(x, state),
+    messages = messages,
     stream = FALSE,
     options = options
   )
@@ -358,8 +412,8 @@ method(build_chat_request_body, OllamaConfig) <- function(
   if (!is.null(effective_think)) {
     request_body[["think"]] <- effective_think
   }
-  if (!is.null(output_schema)) {
-    request_body[["format"]] <- build_response_format(x, output_schema)
+  if (!is.null(format)) {
+    request_body[["format"]] <- format
   }
   if (!is.null(tools) && use_tools) {
     request_body[["tools"]] <- lapply(tools, as_list)
@@ -491,7 +545,7 @@ method(perform_chat_request, OllamaConfig) <- function(
     httr2::req_body_json(request_body) |>
     httr2::req_user_agent("rtemis (www.rtemis.org)") |>
     httr2::req_error(is_error = function(resp) FALSE) |>
-    httr2::req_perform(verbosity = max(verbosity - 1L, 0L))
+    .req_perform_status(verbosity = verbosity)
   .check_http_response(resp, "Ollama")
   resp
 }
@@ -518,9 +572,10 @@ method(perform_chat_request, OpenAIConfig) <- function(
     httr2::req_body_json(request_body) |>
     httr2::req_user_agent("rtemis.llm-r Agent (www.rtemis.org)") |>
     httr2::req_timeout(x@timeout) |>
-    .add_openai_headers(x)
-  resp <- httr2::req_perform(req, verbosity = max(verbosity - 1L, 0L))
-  .check_http_response(resp, .openai_provider_name(x))
+    .add_openai_headers(x) |>
+    httr2::req_error(is_error = function(resp) FALSE)
+  resp <- .req_perform_status(req, verbosity = verbosity)
+  .check_http_response(resp, .openai_provider_name(x), model = x@model_name)
   resp
 }
 
@@ -546,7 +601,6 @@ method(parse_chat_response, OllamaConfig) <- function(x, resp) {
     content = message[["content"]] %||% "",
     reasoning = if (!is.null(reasoning) && nzchar(reasoning)) reasoning,
     tool_calls = message[["tool_calls"]],
-    refusal = NULL,
     metadata = res[setdiff(names(res), "message")]
   )
 }
@@ -578,6 +632,17 @@ method(parse_chat_response, OpenAIConfig) <- function(x, resp) {
   metadata <- res[setdiff(names(res), "choices")]
   metadata[["finish_reason"]] <- choice[["finish_reason"]]
   metadata[["request_id"]] <- httr2::resp_header(resp, "x-request-id")
+  refusal <- message[["refusal"]]
+  if (is.character(refusal) && length(refusal) == 1L && nzchar(refusal)) {
+    .abort_openai_refusal(
+      provider = .openai_provider_name(x),
+      model = res[["model"]] %||% x@model_name,
+      refusal = refusal,
+      finish_reason = choice[["finish_reason"]],
+      request_id = metadata[["request_id"]],
+      status_code = httr2::resp_status(resp)
+    )
+  }
   # Ollama returns its token log probabilities as a flat top-level list, which
   # the Ollama parser sweeps into metadata for free; OpenAI nests the same
   # per-token shape under `choices[[1]]$logprobs$content`. Unwrap it here so
@@ -592,7 +657,6 @@ method(parse_chat_response, OpenAIConfig) <- function(x, resp) {
     content = content,
     reasoning = reasoning,
     tool_calls = message[["tool_calls"]],
-    refusal = message[["refusal"]],
     metadata = metadata
   )
 }
@@ -773,15 +837,16 @@ method(build_chat_messages, AnthropicConfig) <- function(x, state) {
       next
     }
     if (S7_inherits(msg, InputMessage)) {
-      if (!is.null(msg@image_path)) {
-        abort(
-          "Anthropic image inputs are not implemented yet.\n",
-          "Use a text-only prompt or add a provider-specific image adapter first."
-        )
-      }
+      # Images before text, as Anthropic's vision guide recommends. An empty
+      # prompt with images sends the images alone: the API rejects empty text.
       out[[length(out) + 1L]] <- list(
         role = "user",
-        content = list(list(type = "text", text = msg@content))
+        content = c(
+          .anthropic_image_blocks(msg@images),
+          if (is.null(msg@images) || nzchar(msg@content)) {
+            list(list(type = "text", text = msg@content))
+          }
+        )
       )
       next
     }
@@ -806,10 +871,14 @@ method(build_chat_messages, AnthropicConfig) <- function(x, state) {
 # %% build_response_format.AnthropicConfig ----
 #' Build Anthropic Response Format
 #'
+#' On models with structured outputs, the schema goes to `output_config.format`. On other models,
+#' structured output is a forced call of a synthetic tool whose input schema is the output schema.
+#'
 #' @param x AnthropicConfig: Anthropic configuration.
 #' @param output_schema Optional Schema: Output schema.
 #'
-#' @return Optional named list with `tools` and `tool_choice` fields.
+#' @return Optional named list: `format` (the `output_config.format` object), or `tools` and
+#' `tool_choice`.
 #'
 #' @author EDG
 #' @keywords internal
@@ -820,6 +889,15 @@ method(build_response_format, AnthropicConfig) <- function(
 ) {
   if (is.null(output_schema)) {
     return(NULL)
+  }
+  profile <- .anthropic_model_profile(x@model_name, x@capabilities)
+  if (profile[["structured_outputs"]]) {
+    return(list(
+      format = list(
+        type = "json_schema",
+        schema = .anthropic_output_format_schema(as_list(output_schema))
+      )
+    ))
   }
   list(
     tools = list(
@@ -836,17 +914,22 @@ method(build_response_format, AnthropicConfig) <- function(
 # %% build_chat_request_body.AnthropicConfig ----
 #' Build Anthropic Chat Request Body
 #'
+#' Each field follows the request rules of the configured model; a value the model rejects aborts
+#' before the request (spec: llm/anthropic-adapter#request-shape).
+#'
 #' @param x AnthropicConfig: Anthropic configuration.
 #' @param state AgentMemory: Agent memory.
 #' @param tools Optional list: Tools.
 #' @param output_schema Optional Schema: Output schema.
-#' @param think Optional logical: Whether to enable extended thinking.
+#' @param think Optional logical: Per-call override of the config's `think`.
 #' @param use_tools Logical: Whether tools are enabled.
 #' @param temperature Optional numeric \[0, 1\]: Per-call temperature override.
 #' @param top_p Optional numeric \[0, 1\]: Nucleus sampling cutoff.
 #' @param max_tokens Optional integer \[1, Inf): Per-call max_tokens override.
 #' @param stop Optional character: Stop sequence(s) (mapped to `stop_sequences`).
 #' @param top_k Optional integer \[1, Inf): Top-K sampling cutoff.
+#' @param effort Optional character \{"low", "medium", "high", "xhigh", "max"\}: Per-call
+#' override of the config's `effort`.
 #'
 #' @return Named list.
 #'
@@ -864,7 +947,8 @@ method(build_chat_request_body, AnthropicConfig) <- function(
   top_p = NULL,
   max_tokens = NULL,
   stop = NULL,
-  top_k = NULL
+  top_k = NULL,
+  effort = NULL
 ) {
   # Anthropic caps `temperature` at 1, not 2.
   .check_call_options(
@@ -875,18 +959,31 @@ method(build_chat_request_body, AnthropicConfig) <- function(
     top_k = top_k,
     temperature_max = 1
   )
-  request_body <- list(
-    model = x@model_name,
-    messages = build_chat_messages(x, state),
-    max_tokens = as.integer(max_tokens %||% x@max_tokens),
-    temperature = temperature %||% x@temperature
+  check_optional_logical_scalar(think, "think")
+  .check_anthropic_effort_arg(effort)
+  profile <- .anthropic_model_profile(x@model_name, x@capabilities)
+  max_tokens <- as.integer(max_tokens %||% x@max_tokens)
+  fields <- .anthropic_request_fields(
+    profile,
+    temperature = temperature %||% x@temperature,
+    top_p = top_p,
+    top_k = top_k,
+    think = think %||% x@think,
+    thinking_budget_tokens = x@thinking_budget_tokens,
+    effort = effort %||% x@effort,
+    fallbacks = x@fallbacks,
+    max_tokens = max_tokens
   )
-  if (!is.null(top_p)) {
-    request_body[["top_p"]] <- top_p
-  }
-  if (!is.null(top_k)) {
-    request_body[["top_k"]] <- as.integer(top_k)
-  }
+  messages <- build_chat_messages(x, state)
+  .anthropic_check_prefill(profile, messages)
+  request_body <- c(
+    list(
+      model = x@model_name,
+      messages = messages,
+      max_tokens = max_tokens
+    ),
+    fields[["sampling"]]
+  )
   if (!is.null(stop)) {
     request_body[["stop_sequences"]] <- as.character(stop)
   }
@@ -899,19 +996,33 @@ method(build_chat_request_body, AnthropicConfig) <- function(
     tool_specs <- lapply(tools, .tool_to_anthropic_schema)
   }
   response_format <- build_response_format(x, output_schema)
-  if (!is.null(response_format)) {
+  if (!is.null(response_format[["tool_choice"]])) {
+    # The API rejects a forced tool call while thinking is on.
+    if (profile[["known"]] && isTRUE(fields[["thinking_on"]])) {
+      .abort_anthropic_rule(
+        profile,
+        "think",
+        "Structured output on model '",
+        x@model_name,
+        "' is a forced tool call, which the API rejects while thinking is on.\n",
+        "Set `think = FALSE` for structured output on this model."
+      )
+    }
     tool_specs <- c(tool_specs, response_format[["tools"]])
     request_body[["tool_choice"]] <- response_format[["tool_choice"]]
   }
   if (length(tool_specs) > 0L) {
     request_body[["tools"]] <- tool_specs
   }
-  budget <- resolve_anthropic_thinking_budget(x, think = think)
-  if (!is.null(budget)) {
-    request_body[["thinking"]] <- list(
-      type = "enabled",
-      budget_tokens = budget
-    )
+  request_body[["thinking"]] <- fields[["thinking"]]
+  request_body[["fallbacks"]] <- fields[["fallbacks"]]
+  output_config <- list(
+    format = response_format[["format"]],
+    effort = fields[["effort"]]
+  )
+  output_config <- output_config[!vapply(output_config, is.null, logical(1L))]
+  if (length(output_config) > 0L) {
+    request_body[["output_config"]] <- output_config
   }
   if (!is.null(x@extra_body)) {
     request_body[names(x@extra_body)] <- x@extra_body
@@ -942,7 +1053,7 @@ method(perform_chat_request, AnthropicConfig) <- function(
     httr2::req_user_agent("rtemis.llm-r Agent (www.rtemis.org)") |>
     httr2::req_timeout(x@timeout) |>
     .add_anthropic_headers(x)
-  resp <- httr2::req_perform(req, verbosity = max(verbosity - 1L, 0L))
+  resp <- .req_perform_status(req, verbosity = verbosity)
   .check_anthropic_response(resp)
   resp
 }
@@ -968,21 +1079,32 @@ method(parse_chat_response, AnthropicConfig) <- function(x, resp) {
   text_content <- .anthropic_text_from_content(content_blocks)
   reasoning <- .anthropic_reasoning_from_content(content_blocks)
   tool_calls <- .anthropic_tool_calls_from_content(content_blocks)
+  request_id <- httr2::resp_header(resp, "request-id") %||%
+    httr2::resp_header(resp, "x-request-id")
   stop_reason <- res[["stop_reason"]]
-  refusal <- if (identical(stop_reason, "refusal")) {
-    text_content
-  } else {
-    NULL
+  model <- res[["model"]] %||% x@model_name
+  if (identical(stop_reason, "refusal")) {
+    .abort_anthropic_refusal(res, model, text_content, request_id)
+  }
+  if (identical(stop_reason, "max_tokens")) {
+    warn(
+      "Model '",
+      model,
+      "' stopped at `max_tokens` (stop_reason \"max_tokens\"); the response is truncated.\n",
+      "Raise `max_tokens`: thinking counts toward it.",
+      use_warning = TRUE
+    )
   }
   metadata <- res[setdiff(names(res), c("content"))]
   metadata[["raw_content"]] <- content_blocks
-  metadata[["request_id"]] <- httr2::resp_header(resp, "request-id") %||%
-    httr2::resp_header(resp, "x-request-id")
+  metadata[["request_id"]] <- request_id
+  if (!is.null(x@fallbacks)) {
+    metadata[["fallback_served"]] <- .anthropic_fallback_served(res)
+  }
   list(
     content = text_content,
     reasoning = reasoning,
     tool_calls = tool_calls,
-    refusal = refusal,
     metadata = metadata
   )
 }
